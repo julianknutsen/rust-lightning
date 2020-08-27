@@ -117,7 +117,7 @@ fn do_conduit_tests(generator: &mut FuzzGen, initiator_conduit: &mut Conduit, re
 		// randomly choose sender of message
 		let receiver_unencrypted_msg = if generator.generate_bool()? {
 			let encrypted_msg = initiator_conduit.encrypt(sender_unencrypted_msg);
-			if let Ok(msg) = responder_conduit.decrypt_single_message(Some(&encrypted_msg)) {
+			if let Ok(msg) = responder_conduit.decrypt_single_message(&encrypted_msg) {
 				msg
 			} else {
 				assert!(failures_expected);
@@ -125,7 +125,7 @@ fn do_conduit_tests(generator: &mut FuzzGen, initiator_conduit: &mut Conduit, re
 			}
 		} else {
 			let encrypted_msg = responder_conduit.encrypt(sender_unencrypted_msg);
-			if let Ok(msg) = initiator_conduit.decrypt_single_message(Some(&encrypted_msg)) {
+			if let Ok(msg) = initiator_conduit.decrypt_single_message(&encrypted_msg) {
 				msg
 			} else {
 				assert!(failures_expected);

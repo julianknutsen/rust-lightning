@@ -32,7 +32,7 @@ pub(super) struct Decryptor {
 	receiving_nonce: u32,
 
 	pending_message_length: Option<usize>,
-	read_buffer: Option<Vec<u8>>,
+	read_buffer: Vec<u8>,
 	poisoned: bool, // signal an error has occurred so None is returned on iteration after failure
 }
 
@@ -40,11 +40,7 @@ impl Iterator for Decryptor {
 	type Item = Result<Option<Vec<u8>>, String>;
 
 	fn next(&mut self) -> Option<Self::Item> {
-		if self.poisoned {
-			return None;
-		}
-
-		match self.decrypt_single_message(None) {
+		match self.decrypt_single_message(&[]) {
 			Ok(Some(result)) => {
 				Some(Ok(Some(result)))
 			},
@@ -72,7 +68,7 @@ impl Conduit {
 				receiving_key,
 				receiving_chaining_key: chaining_key,
 				receiving_nonce: 0,
-				read_buffer: None,
+				read_buffer: Vec::new(),
 				pending_message_length: None,
 				poisoned: false
 			}
@@ -92,8 +88,9 @@ impl Conduit {
 	/// only the first message will be returned, and the rest stored in the internal buffer.
 	/// If a message pending in the buffer still hasn't been decrypted, that message will be
 	/// returned in lieu of anything new, even if new data is provided.
+	/// After a failure, all calls will return Ok(None)
 	#[cfg(any(test, feature = "fuzztarget"))]
-	pub fn decrypt_single_message(&mut self, new_data: Option<&[u8]>) -> Result<Option<Vec<u8>>, String> {
+	pub fn decrypt_single_message(&mut self, new_data: &[u8]) -> Result<Option<Vec<u8>>, String> {
 		Ok(self.decryptor.decrypt_single_message(new_data)?)
 	}
 
@@ -135,44 +132,32 @@ impl Encryptor {
 
 impl Decryptor {
 	pub(super) fn read(&mut self, data: &[u8]) {
-		let read_buffer = self.read_buffer.get_or_insert(Vec::new());
-		read_buffer.extend_from_slice(data);
+		self.read_buffer.extend(data);
 	}
 
 	/// Decrypt a single message. If data containing more than one message has been received,
 	/// only the first message will be returned, and the rest stored in the internal buffer.
 	/// If a message pending in the buffer still hasn't been decrypted, that message will be
 	/// returned in lieu of anything new, even if new data is provided.
-	pub fn decrypt_single_message(&mut self, new_data: Option<&[u8]>) -> Result<Option<Vec<u8>>, String> {
-		let mut read_buffer = if let Some(buffer) = self.read_buffer.take() {
-			buffer
-		} else {
-			Vec::new()
-		};
-
-		if let Some(data) = new_data {
-			read_buffer.extend_from_slice(data);
+	/// After a failure, all calls will return Ok(None)
+	pub fn decrypt_single_message(&mut self, new_data: &[u8]) -> Result<Option<Vec<u8>>, String> {
+		if self.poisoned {
+			return Ok(None);
 		}
 
-		let (current_message, offset) = self.decrypt(&read_buffer[..])?;
-		read_buffer.drain(..offset); // drain the read buffer
-		self.read_buffer = Some(read_buffer); // assign the new value to the built-in buffer
-		Ok(current_message)
-	}
+		self.read(new_data);
 
-	fn decrypt(&mut self, buffer: &[u8]) -> Result<(Option<Vec<u8>>, usize), String> {
 		let message_length = if let Some(length) = self.pending_message_length {
 			// we have already decrypted the header
 			length
 		} else {
-			if buffer.len() < TAGGED_MESSAGE_LENGTH_HEADER_SIZE {
+			if self.read_buffer.len() < TAGGED_MESSAGE_LENGTH_HEADER_SIZE {
 				// A message must be at least 18 bytes (2 for encrypted length, 16 for the tag)
-				return Ok((None, 0));
+				return Ok(None);
 			}
 
-			let encrypted_length = &buffer[0..TAGGED_MESSAGE_LENGTH_HEADER_SIZE];
 			let mut length_bytes = [0u8; MESSAGE_LENGTH_HEADER_SIZE];
-			chacha::decrypt(&self.receiving_key, self.receiving_nonce as u64, &[0; 0], encrypted_length, &mut length_bytes)?;
+			chacha::decrypt(&self.receiving_key, self.receiving_nonce as u64, &[0; 0], &self.read_buffer[..TAGGED_MESSAGE_LENGTH_HEADER_SIZE], &mut length_bytes)?;
 
 			self.increment_nonce();
 
@@ -182,21 +167,22 @@ impl Decryptor {
 
 		let message_end_index = TAGGED_MESSAGE_LENGTH_HEADER_SIZE + message_length + chacha::TAG_SIZE;
 
-		if buffer.len() < message_end_index {
+		if self.read_buffer.len() < message_end_index {
 			self.pending_message_length = Some(message_length);
-			return Ok((None, 0));
+			return Ok(None);
 		}
 
 		self.pending_message_length = None;
 
-		let encrypted_message = &buffer[TAGGED_MESSAGE_LENGTH_HEADER_SIZE..message_end_index];
 		let mut message = vec![0u8; message_length];
 
-		chacha::decrypt(&self.receiving_key, self.receiving_nonce as u64, &[0; 0], encrypted_message, &mut message)?;
+		chacha::decrypt(&self.receiving_key, self.receiving_nonce as u64, &[0; 0], &self.read_buffer[TAGGED_MESSAGE_LENGTH_HEADER_SIZE..message_end_index], &mut message)?;
 
 		self.increment_nonce();
 
-		Ok((Some(message), message_end_index))
+		self.read_buffer.drain(..message_end_index);
+
+		Ok(Some(message))
 	}
 
 	fn increment_nonce(&mut self) {
@@ -207,10 +193,7 @@ impl Decryptor {
 	// infrastructure to properly encode it
 	#[cfg(test)]
 	pub fn read_buffer_length(&self) -> usize {
-		match &self.read_buffer {
-			&Some(ref vec) => { vec.len() }
-			&None => 0
-		}
+		self.read_buffer.len()
 	}
 }
 
@@ -247,7 +230,7 @@ mod tests {
 		let encrypted_message = connected_peer.encrypt(&message);
 		assert_eq!(encrypted_message.len(), 2 + 16 + 16);
 
-		let decrypted_message = remote_peer.decrypt_single_message(Some(&encrypted_message)).unwrap().unwrap();
+		let decrypted_message = remote_peer.decrypt_single_message(&encrypted_message).unwrap().unwrap();
 		assert_eq!(decrypted_message, vec![]);
 	}
 
@@ -300,13 +283,13 @@ mod tests {
 			let mut current_encrypted_message = encrypted_messages.remove(0);
 			let next_encrypted_message = encrypted_messages.remove(0);
 			current_encrypted_message.extend_from_slice(&next_encrypted_message);
-			let decrypted_message = remote_peer.decrypt_single_message(Some(&current_encrypted_message)).unwrap().unwrap();
+			let decrypted_message = remote_peer.decrypt_single_message(&current_encrypted_message).unwrap().unwrap();
 			assert_eq!(decrypted_message, message);
 		}
 
 		for _ in 0..501 {
 			// decrypt messages directly from buffer without adding to it
-			let decrypted_message = remote_peer.decrypt_single_message(None).unwrap().unwrap();
+			let decrypted_message = remote_peer.decrypt_single_message(&[]).unwrap().unwrap();
 			assert_eq!(decrypted_message, message);
 		}
 	}
@@ -318,7 +301,7 @@ mod tests {
 		let encrypted = remote_peer.encrypt(&[1]);
 
 		connected_peer.decryptor.receiving_key = [0; 32];
-		assert_eq!(connected_peer.decrypt_single_message(Some(&encrypted)), Err("invalid hmac".to_string()));
+		assert_eq!(connected_peer.decrypt_single_message(&encrypted), Err("invalid hmac".to_string()));
 	}
 
 	// Test next()::None
