@@ -160,6 +160,14 @@ impl<PeerHandshakeImpl: IPeerHandshake> ITransport for Transport<PeerHandshakeIm
 			}
 		}
 	}
+
+	fn enqueue_message_if_connected<M: Encode + Writeable, Q: Queueable, L: Deref>(&mut self, message: &M, output_buffer: &mut Q, logger: L)
+		where L::Target: Logger {
+
+		if self.is_connected() {
+			self.enqueue_message(message, output_buffer, logger);
+		}
+	}
 }
 
 #[cfg(test)]
@@ -348,4 +356,63 @@ mod tests {
 
 	// TODO: Backfill connected tests of drain_messages()
 
+
+	// Tests of the enqueueing in both unconnected and connected states
+	#[test]
+	fn inbound_enqueue_message_if_connected_not_connected() {
+		let logger = TestLogger::new();
+		let mut transport = create_inbound_for_test::<PeerHandshakeTestStubFail>();
+		let mut spy = QueueableSpy::new();
+
+		let ping = msgs::Ping {
+			ponglen: 0,
+			byteslen: 64,
+		};
+		transport.enqueue_message_if_connected(&ping, &mut spy, &logger);
+		assert_matches!(&spy.get_recording()[..], []);
+	}
+
+	#[test]
+	fn outbound_enqueue_message_if_connected_not_connected() {
+		let logger = TestLogger::new();
+		let mut transport = create_outbound_for_test::<PeerHandshakeTestStubFail>();
+		let mut spy = QueueableSpy::new();
+
+		let ping = msgs::Ping {
+			ponglen: 0,
+			byteslen: 64,
+		};
+		transport.enqueue_message_if_connected(&ping, &mut spy, &logger);
+		assert_matches!(&spy.get_recording()[..], []);
+	}
+
+	#[test]
+	fn inbound_enqueue_message_if_connected_connected() {
+		let logger = TestLogger::new();
+		let mut transport = create_inbound_for_test::<PeerHandshakeTestStubComplete>();
+		let mut spy = QueueableSpy::new();
+		assert_eq!(Ok(true), transport.process_input(&[], &mut spy));
+
+		let ping = msgs::Ping {
+			ponglen: 0,
+			byteslen: 64,
+		};
+		transport.enqueue_message_if_connected(&ping, &mut spy, &logger);
+		assert_matches!(&spy.get_recording()[..], [_]);
+	}
+
+	#[test]
+	fn outbound_enqueue_message_if_connected_connected() {
+		let logger = TestLogger::new();
+		let mut transport = create_outbound_for_test::<PeerHandshakeTestStubComplete>();
+		let mut spy = QueueableSpy::new();
+		assert_eq!(Ok(true), transport.process_input(&[], &mut spy));
+
+		let ping = msgs::Ping {
+			ponglen: 0,
+			byteslen: 64,
+		};
+		transport.enqueue_message_if_connected(&ping, &mut spy, &logger);
+		assert_matches!(&spy.get_recording()[..], [_]);
+	}
 }

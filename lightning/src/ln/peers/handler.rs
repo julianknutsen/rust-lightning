@@ -57,6 +57,9 @@ pub(super) trait ITransport {
 	/// Encodes, encrypts, and enqueues a message to the outbound queue. Panics if the connection is
 	/// not established yet.
 	fn enqueue_message<M: Encode + Writeable, Q: Queueable, L: Deref>(&mut self, message: &M, output_buffer: &mut Q, logger: L) where L::Target: Logger;
+
+	/// Same as above, but does nothing if the Transport is not connected
+	fn enqueue_message_if_connected<M: Encode + Writeable, Q: Queueable, L: Deref>(&mut self, message: &M, output_buffer: &mut Q, logger: L) where L::Target: Logger;
 }
 
 /// Provides references to trait impls which handle different types of messages.
@@ -855,9 +858,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						let (mut descriptor, peer) = get_peer_for_forwarding!(node_id, {
 								//TODO: Drop the pending channel? (or just let it timeout, but that sucks)
 							});
-						if peer.transport.is_connected() {
-							peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer, &*self.logger);
-						}
+						peer.transport.enqueue_message_if_connected(msg, &mut peer.pending_outbound_buffer, &*self.logger);
 						self.do_attempt_write_data(&mut descriptor, peer);
 					},
 					MessageSendEvent::SendOpenChannel { ref node_id, ref msg } => {
@@ -867,9 +868,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						let (mut descriptor, peer) = get_peer_for_forwarding!(node_id, {
 								//TODO: Drop the pending channel? (or just let it timeout, but that sucks)
 							});
-						if peer.transport.is_connected() {
-							peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer, &*self.logger);
-						}
+						peer.transport.enqueue_message_if_connected(msg, &mut peer.pending_outbound_buffer, &*self.logger);
 						self.do_attempt_write_data(&mut descriptor, peer);
 					},
 					MessageSendEvent::SendFundingCreated { ref node_id, ref msg } => {
@@ -881,9 +880,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 								//TODO: generate a DiscardFunding event indicating to the wallet that
 								//they should just throw away this funding transaction
 							});
-						if peer.transport.is_connected() {
-							peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer, &*self.logger);
-						}
+						peer.transport.enqueue_message_if_connected(msg, &mut peer.pending_outbound_buffer, &*self.logger);
 						self.do_attempt_write_data(&mut descriptor, peer);
 					},
 					MessageSendEvent::SendFundingSigned { ref node_id, ref msg } => {
@@ -894,9 +891,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 								//TODO: generate a DiscardFunding event indicating to the wallet that
 								//they should just throw away this funding transaction
 							});
-						if peer.transport.is_connected() {
-							peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer, &*self.logger);
-						}
+						peer.transport.enqueue_message_if_connected(msg, &mut peer.pending_outbound_buffer, &*self.logger);
 						self.do_attempt_write_data(&mut descriptor, peer);
 					},
 					MessageSendEvent::SendFundingLocked { ref node_id, ref msg } => {
@@ -906,9 +901,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						let (mut descriptor, peer) = get_peer_for_forwarding!(node_id, {
 								//TODO: Do whatever we're gonna do for handling dropped messages
 							});
-						if peer.transport.is_connected() {
-							peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer, &*self.logger);
-						}
+						peer.transport.enqueue_message_if_connected(msg, &mut peer.pending_outbound_buffer, &*self.logger);
 						self.do_attempt_write_data(&mut descriptor, peer);
 					},
 					MessageSendEvent::SendAnnouncementSignatures { ref node_id, ref msg } => {
@@ -919,9 +912,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 								//TODO: generate a DiscardFunding event indicating to the wallet that
 								//they should just throw away this funding transaction
 							});
-						if peer.transport.is_connected() {
-							peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer, &*self.logger);
-						}
+						peer.transport.enqueue_message_if_connected(msg, &mut peer.pending_outbound_buffer, &*self.logger);
 						self.do_attempt_write_data(&mut descriptor, peer);
 					},
 					MessageSendEvent::UpdateHTLCs { ref node_id, updates: msgs::CommitmentUpdate { ref update_add_htlcs, ref update_fulfill_htlcs, ref update_fail_htlcs, ref update_fail_malformed_htlcs, ref update_fee, ref commitment_signed } } => {
@@ -934,24 +925,22 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						let (mut descriptor, peer) = get_peer_for_forwarding!(node_id, {
 								//TODO: Do whatever we're gonna do for handling dropped messages
 							});
-						if peer.transport.is_connected() {
-							for msg in update_add_htlcs {
-								peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer, &*self.logger);
-							}
-							for msg in update_fulfill_htlcs {
-								peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer, &*self.logger);
-							}
-							for msg in update_fail_htlcs {
-								peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer, &*self.logger);
-							}
-							for msg in update_fail_malformed_htlcs {
-								peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer, &*self.logger);
-							}
-							if let &Some(ref msg) = update_fee {
-								peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer, &*self.logger);
-							}
-							peer.transport.enqueue_message(commitment_signed, &mut peer.pending_outbound_buffer, &*self.logger);
+						for msg in update_add_htlcs {
+							peer.transport.enqueue_message_if_connected(msg, &mut peer.pending_outbound_buffer, &*self.logger);
 						}
+						for msg in update_fulfill_htlcs {
+							peer.transport.enqueue_message_if_connected(msg, &mut peer.pending_outbound_buffer, &*self.logger);
+						}
+						for msg in update_fail_htlcs {
+							peer.transport.enqueue_message_if_connected(msg, &mut peer.pending_outbound_buffer, &*self.logger);
+						}
+						for msg in update_fail_malformed_htlcs {
+							peer.transport.enqueue_message_if_connected(msg, &mut peer.pending_outbound_buffer, &*self.logger);
+						}
+						if let &Some(ref msg) = update_fee {
+							peer.transport.enqueue_message_if_connected(msg, &mut peer.pending_outbound_buffer, &*self.logger);
+						}
+						peer.transport.enqueue_message_if_connected(commitment_signed, &mut peer.pending_outbound_buffer, &*self.logger);
 						self.do_attempt_write_data(&mut descriptor, peer);
 					},
 					MessageSendEvent::SendRevokeAndACK { ref node_id, ref msg } => {
@@ -961,9 +950,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						let (mut descriptor, peer) = get_peer_for_forwarding!(node_id, {
 								//TODO: Do whatever we're gonna do for handling dropped messages
 							});
-						if peer.transport.is_connected() {
-							peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer, &*self.logger);
-						}
+						peer.transport.enqueue_message_if_connected(msg, &mut peer.pending_outbound_buffer, &*self.logger);
 						self.do_attempt_write_data(&mut descriptor, peer);
 					},
 					MessageSendEvent::SendClosingSigned { ref node_id, ref msg } => {
@@ -973,9 +960,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						let (mut descriptor, peer) = get_peer_for_forwarding!(node_id, {
 								//TODO: Do whatever we're gonna do for handling dropped messages
 							});
-						if peer.transport.is_connected() {
-							peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer, &*self.logger);
-						}
+						peer.transport.enqueue_message_if_connected(msg, &mut peer.pending_outbound_buffer, &*self.logger);
 						self.do_attempt_write_data(&mut descriptor, peer);
 					},
 					MessageSendEvent::SendShutdown { ref node_id, ref msg } => {
@@ -985,9 +970,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						let (mut descriptor, peer) = get_peer_for_forwarding!(node_id, {
 								//TODO: Do whatever we're gonna do for handling dropped messages
 							});
-						if peer.transport.is_connected() {
-							peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer, &*self.logger);
-						}
+						peer.transport.enqueue_message_if_connected(msg, &mut peer.pending_outbound_buffer, &*self.logger);
 						self.do_attempt_write_data(&mut descriptor, peer);
 					},
 					MessageSendEvent::SendChannelReestablish { ref node_id, ref msg } => {
@@ -997,9 +980,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						let (mut descriptor, peer) = get_peer_for_forwarding!(node_id, {
 								//TODO: Do whatever we're gonna do for handling dropped messages
 							});
-						if peer.transport.is_connected() {
-							peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer, &*self.logger);
-						}
+						peer.transport.enqueue_message_if_connected(msg, &mut peer.pending_outbound_buffer, &*self.logger);
 						self.do_attempt_write_data(&mut descriptor, peer);
 					},
 					MessageSendEvent::BroadcastChannelAnnouncement { ref msg, ref update_msg } => {
@@ -1018,10 +999,8 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 										}
 									}
 								}
-								if peer.transport.is_connected() {
-									peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer, &*self.logger);
-									peer.transport.enqueue_message(update_msg, &mut peer.pending_outbound_buffer, &*self.logger);
-								}
+								peer.transport.enqueue_message_if_connected(msg, &mut peer.pending_outbound_buffer, &*self.logger);
+								peer.transport.enqueue_message_if_connected(update_msg, &mut peer.pending_outbound_buffer, &*self.logger);
 								self.do_attempt_write_data(&mut (*descriptor).clone(), peer);
 							}
 						}
@@ -1034,9 +1013,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 										!peer.should_forward_node_announcement(msg.contents.node_id) {
 									continue
 								}
-								if peer.transport.is_connected() {
-									peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer, &*self.logger);
-								}
+								peer.transport.enqueue_message_if_connected(msg, &mut peer.pending_outbound_buffer, &*self.logger);
 								self.do_attempt_write_data(&mut (*descriptor).clone(), peer);
 							}
 						}
@@ -1049,9 +1026,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 									!peer.should_forward_channel_announcement(msg.contents.short_channel_id)  {
 									continue
 								}
-								if peer.transport.is_connected() {
-									peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer, &*self.logger);
-								}
+								peer.transport.enqueue_message_if_connected(msg, &mut peer.pending_outbound_buffer, &*self.logger);
 								self.do_attempt_write_data(&mut (*descriptor).clone(), peer);
 							}
 						}
@@ -1069,9 +1044,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 											log_trace!(self.logger, "Handling DisconnectPeer HandleError event in peer_handler for node {} with message {}",
 													log_pubkey!(node_id),
 													msg.data);
-											if peer.transport.is_connected() {
-												peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer, &*self.logger);
-											}
+											peer.transport.enqueue_message_if_connected(msg, &mut peer.pending_outbound_buffer, &*self.logger);
 											// This isn't guaranteed to work, but if there is enough free
 											// room in the send buffer, put the error message there...
 											self.do_attempt_write_data(&mut descriptor, &mut peer);
@@ -1091,9 +1064,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 								let (mut descriptor, peer) = get_peer_for_forwarding!(node_id, {
 									//TODO: Do whatever we're gonna do for handling dropped messages
 								});
-								if peer.transport.is_connected() {
-									peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer, &*self.logger);
-								}
+								peer.transport.enqueue_message_if_connected(msg, &mut peer.pending_outbound_buffer, &*self.logger);
 								self.do_attempt_write_data(&mut descriptor, peer);
 							},
 						}
@@ -1172,20 +1143,12 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 					return false;
 				}
 
-				let mut needs_to_write_data = false;
-				if peer.transport.is_connected() {
-					let ping = msgs::Ping {
-						ponglen: 0,
-						byteslen: 64,
-					};
-					peer.transport.enqueue_message(&ping, &mut peer.pending_outbound_buffer, &*self.logger);
-					needs_to_write_data = true;
-				}
-
-				if needs_to_write_data {
-					let mut descriptor_clone = descriptor.clone();
-					self.do_attempt_write_data(&mut descriptor_clone, peer);
-				}
+				let ping = msgs::Ping {
+					ponglen: 0,
+					byteslen: 64,
+				};
+				peer.transport.enqueue_message_if_connected(&ping, &mut peer.pending_outbound_buffer, &*self.logger);
+				self.do_attempt_write_data(&mut descriptor.clone(), peer);
 
 				peer.awaiting_pong = true;
 				true
