@@ -3,10 +3,15 @@
 //! When a handshake completes, it returns an instance of Conduit.
 //! Conduit enables message encryption and decryption, and automatically handles key rotation.
 
+#[cfg(test)]
+#[macro_use]
+mod test_util;
+
 mod chacha;
 pub mod handler;
 mod hkdf5869rfc;
 mod outbound_buffer;
+mod transport;
 
 #[cfg(feature = "fuzztarget")]
 pub mod conduit;
