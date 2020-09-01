@@ -49,7 +49,7 @@ pub(super) trait ITransport {
 	fn process_input(&mut self, input: &[u8], output_buffer: &mut impl PayloadQueuer) -> Result<(), String>;
 
 	/// Returns true if the connection is established and encrypted messages can be sent.
-	fn is_ready_for_encryption(&self) -> bool;
+	fn is_connected(&self) -> bool;
 
 	/// Encodes, encrypts, and enqueues a message to the outbound queue. Panics if the connection is
 	/// not established yet.
@@ -340,7 +340,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 	pub fn get_peer_node_ids(&self) -> Vec<PublicKey> {
 		let peers = self.peers.lock().unwrap();
 		peers.peers.values().filter_map(|p| {
-			if !p.transport.is_ready_for_encryption() || p.their_features.is_none() {
+			if !p.transport.is_connected() || p.their_features.is_none() {
 				return None;
 			}
 			p.their_node_id
@@ -423,7 +423,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 			($msg: expr) => {
 				{
 					log_trace!(self.logger, "Encoding and sending sync update message of type {} to {}", $msg.type_id(), log_pubkey!(peer.their_node_id.unwrap()));
-					assert!(peer.transport.is_ready_for_encryption());
+					assert!(peer.transport.is_connected());
 					peer.transport.enqueue_message($msg, &mut peer.pending_outbound_buffer)
 				}
 			}
@@ -553,7 +553,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						Ok(_) => {
 
 							// If the transport is newly connected, do the appropriate set up for the connection
-							if peer.transport.is_ready_for_encryption() {
+							if peer.transport.is_connected() {
 								let their_node_id = peer.transport.their_node_id.unwrap();
 
 								match peers.node_id_to_descriptor.entry(their_node_id.clone()) {
@@ -922,7 +922,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						let (mut descriptor, peer) = get_peer_for_forwarding!(node_id, {
 								//TODO: Drop the pending channel? (or just let it timeout, but that sucks)
 							});
-						if peer.transport.is_ready_for_encryption() {
+						if peer.transport.is_connected() {
 							peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer);
 						}
 						self.do_attempt_write_data(&mut descriptor, peer);
@@ -934,7 +934,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						let (mut descriptor, peer) = get_peer_for_forwarding!(node_id, {
 								//TODO: Drop the pending channel? (or just let it timeout, but that sucks)
 							});
-						if peer.transport.is_ready_for_encryption() {
+						if peer.transport.is_connected() {
 							peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer);
 						}
 						self.do_attempt_write_data(&mut descriptor, peer);
@@ -948,7 +948,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 								//TODO: generate a DiscardFunding event indicating to the wallet that
 								//they should just throw away this funding transaction
 							});
-						if peer.transport.is_ready_for_encryption() {
+						if peer.transport.is_connected() {
 							peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer);
 						}
 						self.do_attempt_write_data(&mut descriptor, peer);
@@ -961,7 +961,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 								//TODO: generate a DiscardFunding event indicating to the wallet that
 								//they should just throw away this funding transaction
 							});
-						if peer.transport.is_ready_for_encryption() {
+						if peer.transport.is_connected() {
 							peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer);
 						}
 						self.do_attempt_write_data(&mut descriptor, peer);
@@ -973,7 +973,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						let (mut descriptor, peer) = get_peer_for_forwarding!(node_id, {
 								//TODO: Do whatever we're gonna do for handling dropped messages
 							});
-						if peer.transport.is_ready_for_encryption() {
+						if peer.transport.is_connected() {
 							peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer);
 						}
 						self.do_attempt_write_data(&mut descriptor, peer);
@@ -986,7 +986,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 								//TODO: generate a DiscardFunding event indicating to the wallet that
 								//they should just throw away this funding transaction
 							});
-						if peer.transport.is_ready_for_encryption() {
+						if peer.transport.is_connected() {
 							peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer);
 						}
 						self.do_attempt_write_data(&mut descriptor, peer);
@@ -1001,7 +1001,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						let (mut descriptor, peer) = get_peer_for_forwarding!(node_id, {
 								//TODO: Do whatever we're gonna do for handling dropped messages
 							});
-						if peer.transport.is_ready_for_encryption() {
+						if peer.transport.is_connected() {
 							for msg in update_add_htlcs {
 								peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer);
 							}
@@ -1028,7 +1028,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						let (mut descriptor, peer) = get_peer_for_forwarding!(node_id, {
 								//TODO: Do whatever we're gonna do for handling dropped messages
 							});
-						if peer.transport.is_ready_for_encryption() {
+						if peer.transport.is_connected() {
 							peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer);
 						}
 						self.do_attempt_write_data(&mut descriptor, peer);
@@ -1040,7 +1040,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						let (mut descriptor, peer) = get_peer_for_forwarding!(node_id, {
 								//TODO: Do whatever we're gonna do for handling dropped messages
 							});
-						if peer.transport.is_ready_for_encryption() {
+						if peer.transport.is_connected() {
 							peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer);
 						}
 						self.do_attempt_write_data(&mut descriptor, peer);
@@ -1052,7 +1052,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						let (mut descriptor, peer) = get_peer_for_forwarding!(node_id, {
 								//TODO: Do whatever we're gonna do for handling dropped messages
 							});
-						if peer.transport.is_ready_for_encryption() {
+						if peer.transport.is_connected() {
 							peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer);
 						}
 						self.do_attempt_write_data(&mut descriptor, peer);
@@ -1064,7 +1064,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						let (mut descriptor, peer) = get_peer_for_forwarding!(node_id, {
 								//TODO: Do whatever we're gonna do for handling dropped messages
 							});
-						if peer.transport.is_ready_for_encryption() {
+						if peer.transport.is_connected() {
 							peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer);
 						}
 						self.do_attempt_write_data(&mut descriptor, peer);
@@ -1073,7 +1073,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						log_trace!(self.logger, "Handling BroadcastChannelAnnouncement event in peer_handler for short channel id {}", msg.contents.short_channel_id);
 						if self.message_handler.route_handler.handle_channel_announcement(msg).is_ok() && self.message_handler.route_handler.handle_channel_update(update_msg).is_ok() {
 							for (ref descriptor, ref mut peer) in peers.peers.iter_mut() {
-								if !peer.transport.is_ready_for_encryption() || peer.their_features.is_none() ||
+								if !peer.transport.is_connected() || peer.their_features.is_none() ||
 									!peer.should_forward_channel_announcement(msg.contents.short_channel_id) {
 									continue
 								}
@@ -1085,7 +1085,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 										}
 									}
 								}
-								if peer.transport.is_ready_for_encryption() {
+								if peer.transport.is_connected() {
 									peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer);
 									peer.transport.enqueue_message(update_msg, &mut peer.pending_outbound_buffer);
 								}
@@ -1097,11 +1097,11 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						log_trace!(self.logger, "Handling BroadcastNodeAnnouncement event in peer_handler");
 						if self.message_handler.route_handler.handle_node_announcement(msg).is_ok() {
 							for (ref descriptor, ref mut peer) in peers.peers.iter_mut() {
-								if !peer.transport.is_ready_for_encryption() || peer.their_features.is_none() ||
+								if !peer.transport.is_connected() || peer.their_features.is_none() ||
 										!peer.should_forward_node_announcement(msg.contents.node_id) {
 									continue
 								}
-								if peer.transport.is_ready_for_encryption() {
+								if peer.transport.is_connected() {
 									peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer);
 								}
 								self.do_attempt_write_data(&mut (*descriptor).clone(), peer);
@@ -1112,11 +1112,11 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						log_trace!(self.logger, "Handling BroadcastChannelUpdate event in peer_handler for short channel id {}", msg.contents.short_channel_id);
 						if self.message_handler.route_handler.handle_channel_update(msg).is_ok() {
 							for (ref descriptor, ref mut peer) in peers.peers.iter_mut() {
-								if !peer.transport.is_ready_for_encryption() || peer.their_features.is_none() ||
+								if !peer.transport.is_connected() || peer.their_features.is_none() ||
 									!peer.should_forward_channel_announcement(msg.contents.short_channel_id)  {
 									continue
 								}
-								if peer.transport.is_ready_for_encryption() {
+								if peer.transport.is_connected() {
 									peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer);
 								}
 								self.do_attempt_write_data(&mut (*descriptor).clone(), peer);
@@ -1136,7 +1136,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 											log_trace!(self.logger, "Handling DisconnectPeer HandleError event in peer_handler for node {} with message {}",
 													log_pubkey!(node_id),
 													msg.data);
-											if peer.transport.is_ready_for_encryption() {
+											if peer.transport.is_connected() {
 												peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer);
 											}
 											// This isn't guaranteed to work, but if there is enough free
@@ -1158,7 +1158,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 								let (mut descriptor, peer) = get_peer_for_forwarding!(node_id, {
 									//TODO: Do whatever we're gonna do for handling dropped messages
 								});
-								if peer.transport.is_ready_for_encryption() {
+								if peer.transport.is_connected() {
 									peer.transport.enqueue_message(msg, &mut peer.pending_outbound_buffer);
 								}
 								self.do_attempt_write_data(&mut descriptor, peer);
@@ -1232,7 +1232,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 						}
 						None => {
 							// This can't actually happen as we should have hit
-							// is_ready_for_encryption() previously on this same peer.
+							// is_connected() previously on this same peer.
 							unreachable!();
 						},
 					}
@@ -1240,7 +1240,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 				}
 
 				let mut needs_to_write_data = false;
-				if peer.transport.is_ready_for_encryption() {
+				if peer.transport.is_connected() {
 					let ping = msgs::Ping {
 						ponglen: 0,
 						byteslen: 64,
