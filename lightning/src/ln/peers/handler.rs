@@ -200,8 +200,8 @@ enum InitSyncTracker{
 	NodesSyncing(PublicKey),
 }
 
-struct Peer {
-	transport: Transport,
+struct Peer<TransportImpl: ITransport> {
+	transport: TransportImpl,
 	outbound: bool,
 	their_features: Option<InitFeatures>,
 
@@ -212,7 +212,7 @@ struct Peer {
 	awaiting_pong: bool,
 }
 
-impl Peer {
+impl<TransportImpl: ITransport> Peer<TransportImpl> {
 	/// Returns true if the channel announcements/updates for the given channel should be
 	/// forwarded to this peer.
 	/// If we are sending our routing table to this peer and we have not yet sent channel
@@ -237,8 +237,8 @@ impl Peer {
 	}
 }
 
-struct PeerHolder<Descriptor: SocketDescriptor> {
-	peers: HashMap<Descriptor, Peer>,
+struct PeerHolder<Descriptor: SocketDescriptor, TransportImpl: ITransport> {
+	peers: HashMap<Descriptor, Peer<TransportImpl>>,
 	/// Added to by do_read_event for cases where we pushed a message onto the send buffer but
 	/// didn't call do_attempt_write_data to avoid reentrancy. Cleared in process_events()
 	peers_needing_send: HashSet<Descriptor>,
@@ -276,11 +276,18 @@ pub type SimpleRefPeerManager<'a, 'b, 'c, 'd, 'e, 'f, 'g, SD, M, T, F, C, L> = P
 /// SimpleArcPeerManager when you require a PeerManager with a static lifetime, such as when
 /// you're using lightning-net-tokio.
 pub struct PeerManager<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> where
+	CM::Target: ChannelMessageHandler,
+	RM::Target: RoutingMessageHandler,
+	L::Target: Logger {
+		inner: PeerManagerImpl<Descriptor, CM, RM, L>,
+}
+
+struct PeerManagerImpl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref, TransportImpl: ITransport=Transport> where
 		CM::Target: ChannelMessageHandler,
 		RM::Target: RoutingMessageHandler,
 		L::Target: Logger {
 	message_handler: MessageHandler<CM, RM>,
-	peers: Mutex<PeerHolder<Descriptor>>,
+	peers: Mutex<PeerHolder<Descriptor, TransportImpl>>,
 	our_node_secret: SecretKey,
 	ephemeral_key_midstate: Sha256Engine,
 
@@ -312,17 +319,122 @@ impl From<LightningError> for MessageHandlingError {
 /// Manages and reacts to connection events. You probably want to use file descriptors as PeerIds.
 /// PeerIds may repeat, but only after socket_disconnected() has been called.
 impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<Descriptor, CM, RM, L> where
-		CM::Target: ChannelMessageHandler,
-		RM::Target: RoutingMessageHandler,
-		L::Target: Logger {
+	CM::Target: ChannelMessageHandler,
+	RM::Target: RoutingMessageHandler,
+	L::Target: Logger {
+
 	/// Constructs a new PeerManager with the given message handlers and node_id secret key
 	/// ephemeral_random_data is used to derive per-connection ephemeral keys and must be
 	/// cryptographically secure random bytes.
 	pub fn new(message_handler: MessageHandler<CM, RM>, our_node_secret: SecretKey, ephemeral_random_data: &[u8; 32], logger: L) -> Self {
+		Self {
+			inner: PeerManagerImpl::new(message_handler, our_node_secret, ephemeral_random_data, logger)
+		}
+	}
+
+	/// Get the list of node ids for peers which have completed the initial handshake.
+	///
+	/// For outbound connections, this will be the same as the their_node_id parameter passed in to
+	/// new_outbound_connection, however entries will only appear once the initial handshake has
+	/// completed and we are sure the remote peer has the private key for the given node_id.
+	pub fn get_peer_node_ids(&self) -> Vec<PublicKey> {
+		self.inner.get_peer_node_ids()
+	}
+
+	/// Indicates a new outbound connection has been established to a node with the given node_id.
+	/// Note that if an Err is returned here you MUST NOT call socket_disconnected for the new
+	/// descriptor but must disconnect the connection immediately.
+	///
+	/// Returns a small number of bytes to send to the remote node (currently always 50).
+	///
+	/// Panics if descriptor is duplicative with some other descriptor which has not yet had a
+	/// socket_disconnected().
+	pub fn new_outbound_connection(&self, their_node_id: PublicKey, descriptor: Descriptor) -> Result<Vec<u8>, PeerHandleError> {
+		self.inner.new_outbound_connection(their_node_id, descriptor)
+	}
+
+	/// Indicates a new inbound connection has been established.
+	///
+	/// May refuse the connection by returning an Err, but will never write bytes to the remote end
+	/// (outbound connector always speaks first). Note that if an Err is returned here you MUST NOT
+	/// call socket_disconnected for the new descriptor but must disconnect the connection
+	/// immediately.
+	///
+	/// Panics if descriptor is duplicative with some other descriptor which has not yet had
+	/// socket_disconnected called.
+	pub fn new_inbound_connection(&self, descriptor: Descriptor) -> Result<(), PeerHandleError> {
+		self.inner.new_inbound_connection(descriptor)
+	}
+
+	/// Indicates that there is room to write data to the given socket descriptor.
+	///
+	/// May return an Err to indicate that the connection should be closed.
+	///
+	/// Will most likely call send_data on the descriptor passed in (or the descriptor handed into
+	/// new_*\_connection) before returning. Thus, be very careful with reentrancy issues! The
+	/// invariants around calling write_buffer_space_avail in case a write did not fully complete
+	/// must still hold - be ready to call write_buffer_space_avail again if a write call generated
+	/// here isn't sufficient! Panics if the descriptor was not previously registered in a
+	/// new_\*_connection event.
+	pub fn write_buffer_space_avail(&self, descriptor: &mut Descriptor) -> Result<(), PeerHandleError> {
+		self.inner.write_buffer_space_avail(descriptor)
+	}
+
+	/// Indicates that data was read from the given socket descriptor.
+	///
+	/// May return an Err to indicate that the connection should be closed.
+	///
+	/// Will *not* call back into send_data on any descriptors to avoid reentrancy complexity.
+	/// Thus, however, you almost certainly want to call process_events() after any read_event to
+	/// generate send_data calls to handle responses.
+	///
+	/// If Ok(true) is returned, further read_events should not be triggered until a send_data call
+	/// on this file descriptor has resume_read set (preventing DoS issues in the send buffer).
+	///
+	/// Panics if the descriptor was not previously registered in a new_*_connection event.
+	pub fn read_event(&self, peer_descriptor: &mut Descriptor, data: &[u8]) -> Result<bool, PeerHandleError> {
+		self.inner.read_event(peer_descriptor, data)
+	}
+
+	/// Checks for any events generated by our handlers and processes them. Includes sending most
+	/// response messages as well as messages generated by calls to handler functions directly (eg
+	/// functions like ChannelManager::process_pending_htlc_forward or send_payment).
+	pub fn process_events(&self) {
+		self.inner.process_events();
+	}
+
+	/// Indicates that the given socket descriptor's connection is now closed.
+	///
+	/// This must only be called if the socket has been disconnected by the peer or your own
+	/// decision to disconnect it and must NOT be called in any case where other parts of this
+	/// library (eg PeerHandleError, explicit disconnect_socket calls) instruct you to disconnect
+	/// the peer.
+	///
+	/// Panics if the descriptor was not previously registered in a successful new_*_connection event.
+	pub fn socket_disconnected(&self, descriptor: &Descriptor) {
+		self.inner.socket_disconnected(descriptor)
+	}
+
+	/// This function should be called roughly once every 30 seconds.
+	/// It will send pings to each peer and disconnect those which did not respond to the last round of pings.
+
+	/// Will most likely call send_data on all of the registered descriptors, thus, be very careful with reentrancy issues!
+	pub fn timer_tick_occured(&self) {
+		self.inner.timer_tick_occured()
+	}
+}
+
+
+impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref, TransportImpl: ITransport> PeerManagerImpl<Descriptor, CM, RM, L, TransportImpl> where
+		CM::Target: ChannelMessageHandler,
+		RM::Target: RoutingMessageHandler,
+		L::Target: Logger {
+
+	fn new(message_handler: MessageHandler<CM, RM>, our_node_secret: SecretKey, ephemeral_random_data: &[u8; 32], logger: L) -> Self {
 		let mut ephemeral_key_midstate = Sha256::engine();
 		ephemeral_key_midstate.input(ephemeral_random_data);
 
-		PeerManager {
+		PeerManagerImpl {
 			message_handler,
 			peers: Mutex::new(PeerHolder {
 				peers: HashMap::new(),
@@ -337,12 +449,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 		}
 	}
 
-	/// Get the list of node ids for peers which have completed the initial handshake.
-	///
-	/// For outbound connections, this will be the same as the their_node_id parameter passed in to
-	/// new_outbound_connection, however entries will only appear once the initial handshake has
-	/// completed and we are sure the remote peer has the private key for the given node_id.
-	pub fn get_peer_node_ids(&self) -> Vec<PublicKey> {
+	fn get_peer_node_ids(&self) -> Vec<PublicKey> {
 		let peers = self.peers.lock().unwrap();
 		peers.peers.values().filter_map(|p| {
 			if !p.transport.is_connected() || p.their_features.is_none() {
@@ -365,20 +472,16 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 		SecretKey::from_slice(&Sha256::from_engine(ephemeral_hash).into_inner()).expect("You broke SHA-256!")
 	}
 
-	/// Indicates a new outbound connection has been established to a node with the given node_id.
-	/// Note that if an Err is returned here you MUST NOT call socket_disconnected for the new
-	/// descriptor but must disconnect the connection immediately.
-	///
-	/// Returns a small number of bytes to send to the remote node (currently always 50).
-	///
-	/// Panics if descriptor is duplicative with some other descriptor which has not yet had a
-	/// socket_disconnected().
-	pub fn new_outbound_connection(&self, their_node_id: PublicKey, descriptor: Descriptor) -> Result<Vec<u8>, PeerHandleError> {
+	fn new_outbound_connection(&self, their_node_id: PublicKey, descriptor: Descriptor) -> Result<Vec<u8>, PeerHandleError> {
+		let transport = TransportImpl::new_outbound(&self.our_node_secret, &their_node_id, &self.get_ephemeral_key());
+		self.new_outbound_connection_with_transport(descriptor, transport)
+	}
+
+	fn new_outbound_connection_with_transport(&self, descriptor: Descriptor, mut transport: TransportImpl) -> Result<Vec<u8>, PeerHandleError> {
 		let mut peers = self.peers.lock().unwrap();
-		let mut transport = Transport::new_outbound(&self.our_node_secret, &their_node_id, &self.get_ephemeral_key());
 		let initial_bytes = transport.set_up_outbound();
 
-		if peers.peers.insert(descriptor, Peer {
+		if peers.peers.insert(descriptor, Peer::<TransportImpl> {
 			transport,
 			outbound: true,
 			their_features: None,
@@ -394,19 +497,15 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 		Ok(initial_bytes)
 	}
 
-	/// Indicates a new inbound connection has been established.
-	///
-	/// May refuse the connection by returning an Err, but will never write bytes to the remote end
-	/// (outbound connector always speaks first). Note that if an Err is returned here you MUST NOT
-	/// call socket_disconnected for the new descriptor but must disconnect the connection
-	/// immediately.
-	///
-	/// Panics if descriptor is duplicative with some other descriptor which has not yet had
-	/// socket_disconnected called.
-	pub fn new_inbound_connection(&self, descriptor: Descriptor) -> Result<(), PeerHandleError> {
+	fn new_inbound_connection(&self, descriptor: Descriptor) -> Result<(), PeerHandleError> {
+		let transport = TransportImpl::new_inbound(&self.our_node_secret, &self.get_ephemeral_key());
+		self.new_inbound_connection_with_transport(descriptor, transport)
+	}
+
+	fn new_inbound_connection_with_transport(&self, descriptor: Descriptor, transport: TransportImpl) -> Result<(), PeerHandleError> {
 		let mut peers = self.peers.lock().unwrap();
-		if peers.peers.insert(descriptor, Peer {
-			transport: Transport::new_inbound(&self.our_node_secret, &self.get_ephemeral_key()),
+		if peers.peers.insert(descriptor, Peer::<TransportImpl> {
+			transport,
 			outbound: false,
 			their_features: None,
 
@@ -421,7 +520,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 		Ok(())
 	}
 
-	fn do_attempt_write_data(&self, descriptor: &mut Descriptor, peer: &mut Peer) {
+	fn do_attempt_write_data(&self, descriptor: &mut Descriptor, peer: &mut Peer<TransportImpl>) {
 		while !peer.pending_outbound_buffer.is_blocked() {
 			let queue_space = peer.pending_outbound_buffer.queue_space();
 			if queue_space > 0 {
@@ -479,17 +578,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 		}
 	}
 
-	/// Indicates that there is room to write data to the given socket descriptor.
-	///
-	/// May return an Err to indicate that the connection should be closed.
-	///
-	/// Will most likely call send_data on the descriptor passed in (or the descriptor handed into
-	/// new_*\_connection) before returning. Thus, be very careful with reentrancy issues! The
-	/// invariants around calling write_buffer_space_avail in case a write did not fully complete
-	/// must still hold - be ready to call write_buffer_space_avail again if a write call generated
-	/// here isn't sufficient! Panics if the descriptor was not previously registered in a
-	/// new_\*_connection event.
-	pub fn write_buffer_space_avail(&self, descriptor: &mut Descriptor) -> Result<(), PeerHandleError> {
+	fn write_buffer_space_avail(&self, descriptor: &mut Descriptor) -> Result<(), PeerHandleError> {
 		let mut peers = self.peers.lock().unwrap();
 		match peers.peers.get_mut(descriptor) {
 			None => panic!("Descriptor for write_event is not already known to PeerManager"),
@@ -501,19 +590,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 		Ok(())
 	}
 
-	/// Indicates that data was read from the given socket descriptor.
-	///
-	/// May return an Err to indicate that the connection should be closed.
-	///
-	/// Will *not* call back into send_data on any descriptors to avoid reentrancy complexity.
-	/// Thus, however, you almost certainly want to call process_events() after any read_event to
-	/// generate send_data calls to handle responses.
-	///
-	/// If Ok(true) is returned, further read_events should not be triggered until a send_data call
-	/// on this file descriptor has resume_read set (preventing DoS issues in the send buffer).
-	///
-	/// Panics if the descriptor was not previously registered in a new_*_connection event.
-	pub fn read_event(&self, peer_descriptor: &mut Descriptor, data: &[u8]) -> Result<bool, PeerHandleError> {
+	fn read_event(&self, peer_descriptor: &mut Descriptor, data: &[u8]) -> Result<bool, PeerHandleError> {
 		match self.do_read_event(peer_descriptor, data) {
 			Ok(res) => Ok(res),
 			Err(e) => {
@@ -629,7 +706,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 	}
 
 	/// Process an incoming message and return a decision (ok, lightning error, peer handling error) regarding the next action with the peer
-	fn handle_message(&self, peers_needing_send: &mut HashSet<Descriptor>, peer: &mut Peer, peer_descriptor: Descriptor, message: wire::Message) -> Result<(), MessageHandlingError> {
+	fn handle_message(&self, peers_needing_send: &mut HashSet<Descriptor>, peer: &mut Peer<TransportImpl>, peer_descriptor: Descriptor, message: wire::Message) -> Result<(), MessageHandlingError> {
 		log_trace!(self.logger, "Received message of type {} from {}", message.type_id(), log_pubkey!(peer.transport.get_their_node_id()));
 
 		// Need an Init as first message
@@ -815,10 +892,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 		Ok(())
 	}
 
-	/// Checks for any events generated by our handlers and processes them. Includes sending most
-	/// response messages as well as messages generated by calls to handler functions directly (eg
-	/// functions like ChannelManager::process_pending_htlc_forward or send_payment).
-	pub fn process_events(&self) {
+	fn process_events(&self) {
 		{
 			// TODO: There are some DoS attacks here where you can flood someone's outbound send
 			// buffer by doing things like announcing channels on another node. We should be willing to
@@ -1111,15 +1185,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 		}
 	}
 
-	/// Indicates that the given socket descriptor's connection is now closed.
-	///
-	/// This must only be called if the socket has been disconnected by the peer or your own
-	/// decision to disconnect it and must NOT be called in any case where other parts of this
-	/// library (eg PeerHandleError, explicit disconnect_socket calls) instruct you to disconnect
-	/// the peer.
-	///
-	/// Panics if the descriptor was not previously registered in a successful new_*_connection event.
-	pub fn socket_disconnected(&self, descriptor: &Descriptor) {
+	fn socket_disconnected(&self, descriptor: &Descriptor) {
 		self.disconnect_event_internal(descriptor, false);
 	}
 
@@ -1146,11 +1212,7 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 		};
 	}
 
-	/// This function should be called roughly once every 30 seconds.
-	/// It will send pings to each peer and disconnect those which did not respond to the last round of pings.
-
-	/// Will most likely call send_data on all of the registered descriptors, thus, be very careful with reentrancy issues!
-	pub fn timer_tick_occured(&self) {
+	fn timer_tick_occured(&self) {
 		let mut peers_lock = self.peers.lock().unwrap();
 		{
 			let peers = &mut *peers_lock;
@@ -1194,6 +1256,2068 @@ impl<Descriptor: SocketDescriptor, CM: Deref, RM: Deref, L: Deref> PeerManager<D
 				descriptor.disconnect_socket();
 			}
 		}
+	}
+}
+
+// Unit tests of the PeerManager object. This leverage dependency inversion by passing in a Transport
+// test double and configuring it in various ways to create the conditions needed to exercise the
+// interesting code paths. This allows isolated testing of the PeerManager without worrying about
+// handshakes or encryption. The TransportTestStub abstracts that and provides a behavior where
+// enqueue_message() places Messages on the outbound queue unencrypted for easy validation through
+// the SocketDescriptor.
+//
+// In addition, it makes use of the Spy pattern for the MessageHandler and RouteHandler traits to
+// ensure that the correct callbacks are called given the correct inputs.
+#[cfg(test)]
+mod unit_tests {
+	use super::*;
+	use ln::peers::test_util::*;
+
+	use bitcoin::secp256k1::{Secp256k1, Signature};
+	use ln::channelmanager::{PaymentHash, PaymentPreimage};
+	use ln::features::{ChannelFeatures, NodeFeatures};
+	use ln::msgs::*;
+	use util::events::MessageSendEvent::*;
+	use util::test_utils::{RoutingMessageHandlerTestStub, TestLogger, ChannelMessageHandlerTestSpy, TestChannelMessageHandler, RoutingMessageHandlerTestSpy, TestRoutingMessageHandler};
+	use std::cell::RefCell;
+
+	// Split out in a macro so tests can use this value to create test state before the TestCtx is
+	// created
+	macro_rules! test_ctx_their_node_id {
+		() => {{
+			let their_node_secret = SecretKey::from_slice(&[0x_12_u8; 32]).unwrap();
+			PublicKey::from_secret_key(&Secp256k1::new(), &their_node_secret)
+		}}
+	}
+
+	struct TestCtx<CM: ChannelMessageHandler=ChannelMessageHandlerTestSpy, RM: RoutingMessageHandler=RoutingMessageHandlerTestStub> {
+		chan_handler: CM,
+		logger: TestLogger,
+		random_data: [u8; 32],
+		route_handler: RM,
+		their_node_id: PublicKey,
+	}
+
+	impl<CM: ChannelMessageHandler, RM: RoutingMessageHandler> TestCtx<CM, RM> {
+
+		fn new() -> TestCtx<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub> {
+			TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::with_channel_and_routing(ChannelMessageHandlerTestSpy::new(), RoutingMessageHandlerTestStub::new())
+		}
+
+		fn with_channel_and_routing(chan_handler: CM, route_handler: RM) -> Self {
+
+			Self {
+				chan_handler,
+				logger: TestLogger::new(),
+				random_data: [0; 32],
+				route_handler,
+				their_node_id: test_ctx_their_node_id!()
+			}
+		}
+
+		fn with_routing_handler(route_handler: RM) -> TestCtx<ChannelMessageHandlerTestSpy, RM> {
+			TestCtx::<ChannelMessageHandlerTestSpy, RM>::with_channel_and_routing(ChannelMessageHandlerTestSpy::new(), route_handler)
+		}
+
+		fn with_channel_handler(channel_handler: CM) -> TestCtx<CM, RoutingMessageHandlerTestStub> {
+			TestCtx::<CM, RoutingMessageHandlerTestStub>::with_channel_and_routing(channel_handler, RoutingMessageHandlerTestStub::new())
+		}
+	}
+
+	macro_rules! new_unconnected_transport {
+		() => {{
+			RefCell::new(TransportStubBuilder::new().finish())
+		}}
+	}
+
+	macro_rules! new_connected_transport {
+		($test_ctx:expr) => {{
+			RefCell::new(TransportStubBuilder::new().set_connected(&$test_ctx.their_node_id).finish())
+		}}
+	}
+
+	macro_rules! new_peer_manager_for_test {
+		($test_ctx:expr) => {{
+			let our_node_secret = SecretKey::from_slice(&[0x_11_u8; 32]).unwrap();
+			let message_handler = MessageHandler {
+				chan_handler: &$test_ctx.chan_handler,
+				route_handler:  &$test_ctx.route_handler,
+			};
+			PeerManagerImpl::<_, _, _, _, &RefCell<TransportStub>>::new(message_handler, our_node_secret, &$test_ctx.random_data, &$test_ctx.logger)
+		}}
+	}
+
+	// Generates a PeerManager & TransportStub for test that has already connected and parsed
+	// the Init message. To reduce test expansion, this only tests with an outbound connection with
+	// the understanding that after the init process, both connections are identical.
+	macro_rules! new_peer_manager_post_init {
+		($test_ctx: expr, $descriptor: expr, $transport: expr) => {{
+			let mut features = InitFeatures::known();
+			features.clear_initial_routing_sync();
+
+			$transport.borrow_mut().add_incoming_message(Message::Init(Init { features }));
+
+			let peer_manager = new_peer_manager_for_test!(&$test_ctx);
+			new_outbound!(peer_manager, $descriptor, $transport);
+			assert_matches!(peer_manager.read_event($descriptor, &[]), Ok(false));
+
+			// Drain pre-init data from descriptor in recording
+			$descriptor.clear_recording();
+
+			peer_manager
+		}}
+	}
+
+	macro_rules! new_outbound {
+		($peer_manager: expr, $descriptor: expr, $transport: expr) => {{
+			$peer_manager.new_outbound_connection_with_transport($descriptor.clone(), $transport).unwrap()
+		}}
+	}
+
+	macro_rules! new_inbound {
+		($peer_manager: expr, $descriptor: expr, $transport: expr) => {{
+			$peer_manager.new_inbound_connection_with_transport($descriptor.clone(), $transport).unwrap()
+		}}
+	}
+
+	// Assert read_event() returns an error with the proper no_connection_possible set
+	macro_rules! assert_read_event_errors {
+		($peer_manager: expr, $descriptor: expr, $no_connection_possible: expr) => {{
+			assert_matches!($peer_manager.read_event($descriptor, &[]), Err(PeerHandleError { no_connection_possible: $no_connection_possible }))
+		}}
+	}
+
+	// Assert that a given slice matches a wire::Message pattern
+	macro_rules! assert_matches_message {
+		($bytes: expr, $message_pattern: pat) => {{
+			let mut reader = ::std::io::Cursor::new($bytes);
+			let message_result = wire::read(&mut reader);
+			let message = message_result.unwrap();
+			assert_matches!(message, $message_pattern)
+		}}
+	}
+
+	// Convenience macro for returning the spy value by function name
+	macro_rules! channel_handler_called {
+		($test_ctx:expr, $fn_name: ident) => {{
+			$test_ctx.chan_handler.called.lock().unwrap().$fn_name
+		}}
+	}
+
+	// Convenience macro for returning the spy value by function name
+	macro_rules! route_handler_called {
+		($test_ctx:expr, $fn_name: ident) => {{
+			$test_ctx.route_handler.called.lock().unwrap().$fn_name
+		}}
+	}
+
+	//   ____                _   _____                 _     _____         _   _
+	// 	|  _ \ ___  __ _  __| | | ____|_   _____ _ __ | |_  |_   _|__  ___| |_(_)_ __   __ _
+	// 	| |_) / _ \/ _` |/ _` | |  _| \ \ / / _ \ '_ \| __|   | |/ _ \/ __| __| | '_ \ / _` |
+	//  |  _ <  __/ (_| | (_| | | |___ \ V /  __/ | | | |_    | |  __/\__ \ |_| | | | | (_| |
+	// 	|_| \_\___|\__,_|\__,_| |_____| \_/ \___|_| |_|\__|   |_|\___||___/\__|_|_| |_|\__, |
+	// 	                                                                                |___/
+
+	// Test that a new inbound connection:
+	// * does not show up in get_peer_node_ids()
+	#[test]
+	fn new_inbound_not_in_get_peer_node_ids() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let descriptor = SocketDescriptorMock::new();
+		let mut transport = new_unconnected_transport!();
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+
+		new_inbound!(peer_manager, descriptor, &mut transport);
+
+		assert!(peer_manager.get_peer_node_ids().is_empty());
+		descriptor.assert_called_with(vec![]);
+	}
+
+	// Test that a new outbound connection:
+	// * does not show up in get_peer_node_ids()
+	#[test]
+	fn new_outbound_not_in_get_peer_node_ids() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let descriptor = SocketDescriptorMock::new();
+		let mut transport = new_unconnected_transport!();
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+
+		new_outbound!(peer_manager, descriptor, &mut transport);
+
+		assert!(peer_manager.get_peer_node_ids().is_empty());
+		descriptor.assert_called_with(vec![]);
+	}
+
+	// Test that a new inbound connection:
+	// * returns errors from the Transport code
+	#[test]
+	fn new_inbound_transport_error_returns_error() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let mut transport = RefCell::new(TransportStubBuilder::new().process_returns_error().finish());
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+
+		new_inbound!(peer_manager, descriptor, &mut transport);
+
+		assert_read_event_errors!(peer_manager, &mut descriptor, false);
+	}
+
+	// Test that a new outbound connection:
+	// * returns errors from the Transport code
+	#[test]
+	fn new_outbound_transport_error_returns_error() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let mut transport = RefCell::new(TransportStubBuilder::new().process_returns_error().finish());
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+
+		new_outbound!(peer_manager, descriptor, &mut transport);
+
+		assert_read_event_errors!(peer_manager, &mut descriptor, false);
+	}
+
+	// Test that an inbound connection with a connected Transport, but no Init message
+	// * does not show up in get_peer_node_ids()
+	// * does not send an Init message in process_events() (must receive from Initiator first)
+	#[test]
+	fn inbound_connected_transport_not_in_get_peer_node_ids() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let mut transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+
+		new_inbound!(peer_manager, descriptor, &mut transport);
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+
+		assert!(peer_manager.get_peer_node_ids().is_empty());
+		peer_manager.process_events();
+		descriptor.assert_called_with(vec![]);
+	}
+
+	// Test that an outbound connection with a connected Transport, but no Init message
+	// * does not call peer_disconnected callback if an error is returned from Transport
+	// XXXBUG: peer_connected is called after the Init message, but peer_disconnected is called
+	//         with any error after the NOISE handshake is complete
+	#[test]
+	fn outbound_connected_transport_error_does_not_call_peer_disconnected_on_error() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+		new_outbound!(peer_manager, descriptor, &transport);
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+
+		// Signal the error in transport and ensure we don't send a dangling peer_disconnected
+		transport.borrow_mut().process_returns_error();
+		assert_read_event_errors!(peer_manager, &mut descriptor, false);
+		assert!(!channel_handler_called!(&test_ctx, peer_connected));
+		// assert!(!channel_handler_called!(&test_ctx, peer_disconnected));
+	}
+
+	// Test that an inbound connection with a connected Transport and queued Init message:
+	// * XXXBUG: does not send anything in read_event()
+	// * responds with an Init message in process_events()
+	// * calls the peer_connected channel manager callback
+	#[test]
+	fn inbound_connected_transport_responds_with_init() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let mut transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+		transport.borrow_mut().add_incoming_message(Message::Init(Init { features: InitFeatures::known() }));
+
+		new_inbound!(peer_manager, descriptor, &mut transport);
+
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+		// descriptor.assert_called_with(vec![]);
+
+		peer_manager.process_events();
+
+		let recording = descriptor.get_recording();
+		assert_matches_message!(&recording[0].0, Message::Init(_));
+		assert!(channel_handler_called!(&test_ctx, peer_connected));
+	}
+
+	// Test that an inbound connection with a connected Transport and queued Init message:
+	// * read_event() returns true if the outbound queue is full
+	// * read_event() returns false once room is made and write_buffer_space_avail is called
+	// Test leverages a 0 capacity SocketDescriptor and the initial routing sync from TestRoutingMessagehandler
+	// to fill the queue
+	#[test]
+	fn inbound_connected_transport_full_outbound_queue() {
+		let routing_handler = TestRoutingMessageHandler::new();
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, TestRoutingMessageHandler>::with_routing_handler(routing_handler);
+		let mut descriptor = SocketDescriptorMock::with_fixed_size(0);
+		let mut transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+		transport.borrow_mut().add_incoming_message(Message::Init(Init { features: InitFeatures::known() }));
+
+		new_inbound!(peer_manager, descriptor, &mut transport);
+
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(true));
+
+		// Call w/o write_buffer_space_avail still returns Ok(true)
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(true));
+
+		// Call w/o more room in SocketDescriptor still returns Ok(true)
+		peer_manager.write_buffer_space_avail(&mut descriptor).unwrap();
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(true));
+
+		// Call after more room in SocketDescriptor returns Ok(false)
+		descriptor.make_room(100000);
+		peer_manager.write_buffer_space_avail(&mut descriptor).unwrap();
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+
+		peer_manager.process_events();
+
+		let recording = descriptor.get_recording();
+		assert_matches_message!(&recording[0].0, Message::Init(_));
+		assert!(channel_handler_called!(&test_ctx, peer_connected));
+	}
+
+	// Test that an outbound connection with a connected Transport
+	// * does not show up in get_peer_node_ids()
+	// * XXXBUG: does not send anything in read_event()
+	// * sends an Init message in process_events()
+	#[test]
+	fn outbound_connected_transport_sends_init_in_process_events() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let mut transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+
+		new_outbound!(peer_manager, descriptor, &mut transport);
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+		// XXXBUG: Should not call back into descriptor
+		// descriptor.assert_called_with(vec![]);
+
+		assert!(peer_manager.get_peer_node_ids().is_empty());
+
+		peer_manager.process_events();
+		let recording = descriptor.get_recording();
+		assert_eq!(1, recording.len());
+
+		assert_matches_message!(&recording[0].0, Message::Init(_));
+	}
+
+	// Test that an outbound connection with a connected Transport
+	// * errors when receiving a Non-Init message first
+	// * calls the peer_disconnected channel manager callback
+	#[test]
+	fn inbound_connected_transport_non_init_first_fails() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let mut transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+		transport.borrow_mut().add_incoming_message(Message::Ping(Ping { ponglen: 0, byteslen: 0 }));
+
+		new_inbound!(peer_manager, descriptor, &mut transport);
+		assert_read_event_errors!(peer_manager, &mut descriptor, false);
+		assert!(channel_handler_called!(&test_ctx, peer_disconnected));
+	}
+
+	// Test that an outbound connection with a connected Transport
+	// * errors when receiving a Non-Init message first
+	// * calls the peer_disconnected channel manager callback
+	#[test]
+	fn outbound_connected_transport_non_init_first_fails() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let mut transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+		transport.borrow_mut().add_incoming_message(Message::Ping(Ping { ponglen: 0, byteslen: 0 }));
+
+		new_outbound!(peer_manager, descriptor, &mut transport);
+		assert_read_event_errors!(peer_manager, &mut descriptor, false);
+		assert!(channel_handler_called!(&test_ctx, peer_disconnected));
+	}
+
+	// Test that an inbound connection with a connected Transport
+	// * errors out with no_connection_possible if an Init message contains requires_unknown_bits
+	// * calls the peer_disconnected channel manager callback
+	#[test]
+	fn inbound_connected_transport_init_with_required_unknown_first_fails() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let mut transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+		let mut features = InitFeatures::known();
+		features.set_required_unknown_bits();
+		transport.borrow_mut().add_incoming_message(Message::Init(Init { features }));
+
+		new_inbound!(peer_manager, descriptor, &mut transport);
+		assert_read_event_errors!(peer_manager, &mut descriptor, true);
+		assert!(channel_handler_called!(&test_ctx, peer_disconnected));
+	}
+
+	// Test that an outbound connection with a connected Transport
+	// * errors out with no_connection_possible if an Init message contains requires_unknown_bits
+	// * calls the peer_disconnected channel manager callback
+	#[test]
+	fn outbound_connected_transport_init_with_required_unknown_first_fails() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let mut transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+		let mut features = InitFeatures::known();
+		features.set_required_unknown_bits();
+		transport.borrow_mut().add_incoming_message(Message::Init(Init { features }));
+
+		new_outbound!(peer_manager, descriptor, &mut transport);
+		assert_read_event_errors!(peer_manager, &mut descriptor, true);
+		assert!(channel_handler_called!(&test_ctx, peer_disconnected));
+	}
+
+	// Test that an inbound connection with a connected Transport
+	// * errors out with no_connection_possible if an Init message does not contain requires_static_remote_key
+	// * calls the peer_disconnected channel manager callback
+	#[test]
+	fn inbound_connected_transport_init_with_clear_requires_static_remote_key() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let mut transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+		let mut features = InitFeatures::known();
+		features.clear_requires_static_remote_key();
+		transport.borrow_mut().add_incoming_message(Message::Init(Init { features }));
+
+		new_inbound!(peer_manager, descriptor, &mut transport);
+		assert_read_event_errors!(peer_manager, &mut descriptor, true);
+		assert!(channel_handler_called!(&test_ctx, peer_disconnected));
+	}
+
+	// Test that an outbound connection with a connected Transport
+	// * errors out with no_connection_possible if an Init message does not contain requires_static_remote_key
+	// * calls the peer_disconnected channel manager callback
+	#[test]
+	fn outbound_connected_transport_init_with_clear_requires_static_remote_key() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let mut transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+		let mut features = InitFeatures::known();
+		features.clear_requires_static_remote_key();
+		transport.borrow_mut().add_incoming_message(Message::Init(Init { features }));
+
+		new_outbound!(peer_manager, descriptor, &mut transport);
+		assert_read_event_errors!(peer_manager, &mut descriptor, true);
+		assert!(channel_handler_called!(&test_ctx, peer_disconnected));
+	}
+
+	// Test that an inbound connection with a connected Transport and queued Init Message:
+	// * shows up in get_peer_node_ids()
+	// * calls the peer_connected channel manager callback
+	#[test]
+	fn inbound_connected_transport_after_init_in_get_peer_node_ids() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let mut transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+		transport.borrow_mut().add_incoming_message(Message::Init(Init { features: InitFeatures::known() }));
+
+		new_inbound!(peer_manager, descriptor, &mut transport);
+
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+
+		assert!(peer_manager.get_peer_node_ids().contains(&test_ctx.their_node_id));
+		assert!(channel_handler_called!(&test_ctx, peer_connected));
+	}
+
+	// Test that an outbound connection with a connected Transport and queued Init Message:
+	// * shows up in get_peer_node_ids()
+	// * calls the peer_connected channel manager callback
+	#[test]
+	fn outbound_connected_transport_after_init_in_get_peer_node_ids() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let mut transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+		transport.borrow_mut().add_incoming_message(Message::Init(Init { features: InitFeatures::known() }));
+
+		new_outbound!(peer_manager, descriptor, &mut transport);
+
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+
+		assert!(peer_manager.get_peer_node_ids().contains(&test_ctx.their_node_id));
+		assert!(channel_handler_called!(&test_ctx, peer_connected));
+	}
+
+	// Test that a post-Init connection:
+	// * is removed from get_peer_node_ids() on an error coming out of Transport
+	// * calls the peer_disconnected channel manager callback
+	#[test]
+	fn post_init_connected_after_error_not_in_get_peer_node_ids() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		// Set transport to return an error
+		transport.borrow_mut().process_returns_error();
+
+		// Verify errors out and removed from get_peer_node_ids()
+		assert_read_event_errors!(peer_manager, &mut descriptor, false);
+		assert!(peer_manager.get_peer_node_ids().is_empty());
+		assert!(channel_handler_called!(&test_ctx, peer_disconnected));
+	}
+
+	// Test that a post-Init duplicate connection:
+	// * is errored during read_event()
+	// * and the original connection is still in get_peer_node_ids()
+	#[test]
+	fn post_init_duplicate_connection_errors_and_original_keeps_existing() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		// Create a duplicate connection from the same node_id
+		let mut duplicate_connection_descriptor = SocketDescriptorMock::new();
+		let mut duplicate_connection_transport = RefCell::new(TransportStubBuilder::new()
+			.set_connected(&test_ctx.their_node_id)
+			.finish());
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		assert!(peer_manager.get_peer_node_ids().contains(&test_ctx.their_node_id));
+
+		// Duplicate connection errors out
+		new_outbound!(peer_manager, duplicate_connection_descriptor, &mut duplicate_connection_transport);
+		assert_read_event_errors!(peer_manager, &mut duplicate_connection_descriptor, false);
+
+		// And any queued messages such as an outgoing Init are never sent
+		peer_manager.process_events();
+		duplicate_connection_descriptor.assert_called_with(vec![]);
+
+		// But the original still exists in get_peer_node_ids()
+		assert!(peer_manager.get_peer_node_ids().contains(&test_ctx.their_node_id));
+	}
+
+	//   __  __                                  _____         _   _
+	// 	|  \/  | ___  ___ ___  __ _  __ _  ___  |_   _|__  ___| |_(_)_ __   __ _
+	// 	| |\/| |/ _ \/ __/ __|/ _` |/ _` |/ _ \   | |/ _ \/ __| __| | '_ \ / _` |
+	//  | |  | |  __/\__ \__ \ (_| | (_| |  __/   | |  __/\__ \ |_| | | | | (_| |
+	// 	|_|  |_|\___||___/___/\__,_|\__, |\___|   |_|\___||___/\__|_|_| |_|\__, |
+	// 	                             |___/                                  |___/
+
+	// Test that a post-Init connection:
+	// * returns an error if it receives a second Init message
+	// * calls the peer_disconnected channel manager callback
+	#[test]
+	fn post_init_second_init_fails() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		transport.borrow_mut().add_incoming_message(Message::Init(Init { features: InitFeatures::known() }));
+
+		assert_read_event_errors!(peer_manager, &mut descriptor, false);
+		assert!(channel_handler_called!(&test_ctx, peer_disconnected));
+	}
+
+	// Test that a post-Init connection:
+	// * does not propagate an Error Message with no printable
+	// * calls the handle_error channel manager callback
+	#[test]
+	fn post_init_error_message_without_printable() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		transport.borrow_mut().add_incoming_message(Message::Error(ErrorMessage { channel_id: [1; 32], data: "".to_string() }));
+
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+		assert!(channel_handler_called!(&test_ctx, handle_error));
+	}
+
+	// Test that a post-Init connection:
+	// * does not propagate an Error Message with printable
+	// * calls the handle_error channel manager callback
+	#[test]
+	fn post_init_error_message_with_printable() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		transport.borrow_mut().add_incoming_message(Message::Error(ErrorMessage { channel_id: [1; 32], data: "error".to_string() }));
+
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+		assert!(channel_handler_called!(&test_ctx, handle_error));
+	}
+
+	// Test that a post-Init connection:
+	// * does not propagate an Error Message with a control character
+	// * calls the handle_error channel manager callback
+	#[test]
+	fn post_init_error_message_with_non_ascii_ignored() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		transport.borrow_mut().add_incoming_message(Message::Error(ErrorMessage { channel_id: [1; 32], data: "\x00".to_string() }));
+
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+		assert!(channel_handler_called!(&test_ctx, handle_error));
+	}
+
+	// Test that a post-Init connection:
+	// * Returns an error when it receives an Error Message with a 0 channel_id
+	// * calls the handle_error channel manager callback
+	#[test]
+	fn post_init_error_message_with_zero_channel_id() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		transport.borrow_mut().add_incoming_message(Message::Error(ErrorMessage { channel_id: [0; 32], data: "".to_string() }));
+
+		assert_read_event_errors!(peer_manager, &mut descriptor, true);
+		assert!(channel_handler_called!(&test_ctx, handle_error));
+	}
+
+	// Test that a post-Init connection:
+	// * Returns an error when it receives Message::Unknown (even)
+	#[test]
+	fn post_init_unknown_message_even() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		transport.borrow_mut().add_incoming_message(Message::Unknown(wire::MessageType(254)));
+
+		assert_read_event_errors!(peer_manager, &mut descriptor, true);
+	}
+
+	// Test that a post-Init connection:
+	// * Ignores a Message::Unknown (odd)
+	#[test]
+	fn post_init_unknown_message_odd() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		transport.borrow_mut().add_incoming_message(Message::Unknown(wire::MessageType(255)));
+
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+	}
+
+	// Intentionally different from TestCtx::their_node_id do test known and unknown ids
+	macro_rules! fake_public_key {
+		() => {{
+			let their_node_secret = SecretKey::from_slice(&[0x_11_u8; 32]).unwrap();
+			PublicKey::from_secret_key(&Secp256k1::new(), &their_node_secret)
+		}}
+	}
+
+	macro_rules! fake_valid_sig {
+		() => {{
+			Signature::from_der(hex::decode("3046022100839c1fbc5304de944f697c9f4b1d01d1faeba32d751c0f7acb21ac8a0f436a72022100e89bd46bb3a5a62adc679f659b7ce876d83ee297c7a5587b2011c4fcc72eab45").unwrap().as_slice()).unwrap()
+		}}
+	}
+
+	// Test that a post-init connection:
+	// * calls the correct ChannelMessageHandler callback given the correct message type
+	macro_rules! generate_handle_message_test {
+		($expected_cb: ident, $msg: expr) => {
+			#[test]
+			fn $expected_cb() {
+				let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+				let mut descriptor = SocketDescriptorMock::new();
+				let transport = new_connected_transport!(&test_ctx);
+				let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+				transport.borrow_mut().add_incoming_message($msg);
+
+				assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+				assert!(channel_handler_called!(&test_ctx, $expected_cb));
+			}
+		}
+	}
+
+	macro_rules! open_channel_msg {
+		() => {{
+			OpenChannel {
+				chain_hash: Default::default(),
+				temporary_channel_id: [0; 32],
+				funding_satoshis: 0,
+				push_msat: 0,
+				dust_limit_satoshis: 0,
+				max_htlc_value_in_flight_msat: 0,
+				channel_reserve_satoshis: 0,
+				htlc_minimum_msat: 0,
+				feerate_per_kw: 0,
+				to_self_delay: 0,
+				max_accepted_htlcs: 0,
+				funding_pubkey: fake_public_key!(),
+				revocation_basepoint: fake_public_key!(),
+				delayed_payment_basepoint: fake_public_key!(),
+				htlc_basepoint: fake_public_key!(),
+				payment_point: fake_public_key!(),
+				first_per_commitment_point: fake_public_key!(),
+				channel_flags: 0,
+				shutdown_scriptpubkey: OptionalField::Absent
+			}
+		}}
+	}
+
+	generate_handle_message_test!(handle_open_channel, Message::OpenChannel(open_channel_msg!()));
+
+	macro_rules! accept_channel_msg {
+		() => {{
+			AcceptChannel {
+				temporary_channel_id: [0; 32],
+				dust_limit_satoshis: 0,
+				max_htlc_value_in_flight_msat: 0,
+				channel_reserve_satoshis: 0,
+				htlc_minimum_msat: 0,
+				minimum_depth: 0,
+				to_self_delay: 0,
+				max_accepted_htlcs: 0,
+				funding_pubkey: fake_public_key!(),
+				revocation_basepoint: fake_public_key!(),
+				payment_point: fake_public_key!(),
+				delayed_payment_basepoint: fake_public_key!(),
+				htlc_basepoint: fake_public_key!(),
+				first_per_commitment_point: fake_public_key!(),
+				shutdown_scriptpubkey: OptionalField::Absent
+			}
+		}}
+	}
+	generate_handle_message_test!(handle_accept_channel, {
+		Message::AcceptChannel(accept_channel_msg!())
+	});
+
+	macro_rules! funding_created_msg {
+		() => {{
+			FundingCreated {
+				temporary_channel_id: [0; 32],
+				funding_txid: Default::default(),
+				funding_output_index: 0,
+				signature: fake_valid_sig!()
+			}
+		}}
+	}
+
+	generate_handle_message_test!(handle_funding_created, {
+		Message::FundingCreated(funding_created_msg!())
+	});
+
+	macro_rules! funding_signed_msg {
+		() => {{
+			FundingSigned {
+				channel_id: [0; 32],
+				signature: fake_valid_sig!()
+			}
+		}}
+	}
+
+	generate_handle_message_test!(handle_funding_signed, {
+		Message::FundingSigned(funding_signed_msg!())
+	});
+
+	macro_rules! funding_locked_msg {
+		() => {{
+			FundingLocked {
+				channel_id: [0; 32],
+				next_per_commitment_point: fake_public_key!()
+			}
+		}}
+	}
+
+	generate_handle_message_test!(handle_funding_locked, {
+		Message::FundingLocked(funding_locked_msg!())
+	});
+
+	macro_rules! shutdown_msg {
+		() => {{
+			Shutdown {
+				channel_id: [0; 32],
+				scriptpubkey: Default::default()
+			}
+		}}
+	}
+
+	generate_handle_message_test!(handle_shutdown, {
+		Message::Shutdown(shutdown_msg!())
+	});
+
+	macro_rules! closing_signed_msg {
+		() => {{
+			ClosingSigned {
+				channel_id: [0; 32],
+				fee_satoshis: 0,
+				signature: fake_valid_sig!()
+			}
+		}}
+	}
+
+	generate_handle_message_test!(handle_closing_signed, {
+		Message::ClosingSigned(closing_signed_msg!())
+	});
+
+	macro_rules! update_add_htlc_msg {
+		() => {{
+			UpdateAddHTLC {
+				channel_id: [0; 32],
+				htlc_id: 0,
+				amount_msat: 0,
+				payment_hash: PaymentHash([0; 32]),
+				cltv_expiry: 0,
+				onion_routing_packet: OnionPacket {
+					version: 0,
+					public_key: Ok(fake_public_key!()),
+					hop_data: [0; 1300],
+					hmac: [0; 32]
+				}
+			}
+		}}
+	}
+
+	generate_handle_message_test!(handle_update_add_htlc, {
+		Message::UpdateAddHTLC(update_add_htlc_msg!())
+	});
+
+	macro_rules! update_fulfill_htlc_msg {
+		() => {{
+			UpdateFulfillHTLC {
+				channel_id: [0; 32],
+				htlc_id: 0,
+				payment_preimage: PaymentPreimage([0; 32])
+			}
+		}}
+	}
+
+	generate_handle_message_test!(handle_update_fulfill_htlc, {
+		Message::UpdateFulfillHTLC(update_fulfill_htlc_msg!())
+	});
+
+	macro_rules! update_fail_htlc_msg {
+		() => {{
+			UpdateFailHTLC {
+				channel_id: [0; 32],
+				htlc_id: 0,
+				reason: OnionErrorPacket { data: vec![] }
+			}
+		}}
+	}
+
+	generate_handle_message_test!(handle_update_fail_htlc, {
+		Message::UpdateFailHTLC(update_fail_htlc_msg!())
+	});
+
+	macro_rules! update_fail_malformed_htlc_msg {
+		() => {
+			UpdateFailMalformedHTLC {
+				channel_id: [0; 32],
+				htlc_id: 0,
+				sha256_of_onion: [0; 32],
+				failure_code: 0
+			}
+		}
+	}
+	generate_handle_message_test!(handle_update_fail_malformed_htlc, {
+		Message::UpdateFailMalformedHTLC(update_fail_malformed_htlc_msg!())
+	});
+
+	macro_rules! commitment_signed_msg {
+		() => {{
+			CommitmentSigned {
+				channel_id: [0; 32],
+				signature: fake_valid_sig!(),
+				htlc_signatures: vec![]
+			}
+		}}
+	}
+
+	generate_handle_message_test!(handle_commitment_signed, {
+		Message::CommitmentSigned(commitment_signed_msg!())
+	});
+
+	macro_rules! revoke_and_ack_msg {
+		() => {{
+			RevokeAndACK {
+				channel_id: [0; 32],
+				per_commitment_secret: [0; 32],
+				next_per_commitment_point: fake_public_key!()
+			}
+		}}
+	}
+
+	generate_handle_message_test!(handle_revoke_and_ack, {
+		Message::RevokeAndACK(revoke_and_ack_msg!())
+	});
+
+	macro_rules! update_fee_msg {
+		() => {{
+			UpdateFee {
+				channel_id: [0; 32],
+				feerate_per_kw: 0
+			}
+		}}
+	}
+
+	generate_handle_message_test!(handle_update_fee, {
+		Message::UpdateFee(update_fee_msg!())
+	});
+
+	macro_rules! channel_reestablish_msg {
+		() => {{
+			ChannelReestablish {
+				channel_id: [0; 32],
+				next_local_commitment_number: 0,
+				next_remote_commitment_number: 0,
+				data_loss_protect: OptionalField::Absent
+			}
+		}}
+	}
+
+	generate_handle_message_test!(handle_channel_reestablish, {
+		Message::ChannelReestablish(channel_reestablish_msg!())
+	});
+
+	macro_rules! announcement_signatures_msg {
+		() => {{
+			AnnouncementSignatures {
+				channel_id: [0;32],
+				short_channel_id: 0,
+				node_signature: fake_valid_sig!(),
+				bitcoin_signature: fake_valid_sig!()
+			}
+		}}
+	}
+
+	generate_handle_message_test!(handle_announcement_signatures, {
+		Message::AnnouncementSignatures(announcement_signatures_msg!())
+	});
+
+	// Test that a post-Init connection:
+	// * Returns an error if a ChannelAnnouncement message is received and the routing handler
+	//   returns ErrorAction::DisconnectPeer
+	// * calls the peer_disconnected channel manager callback
+	// * is removed from get_peer_node_ids()
+	// * disconnect_socket() is not called on the SocketDescriptor
+	#[test]
+	fn post_init_handle_channel_announcement_disconnect_peer() {
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_channel_announcement_return = Err(msgs::LightningError { err: "", action: msgs::ErrorAction::DisconnectPeer { msg: None } });
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::with_routing_handler(routing_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		transport.borrow_mut().add_incoming_message(Message::ChannelAnnouncement(ChannelAnnouncement {
+			node_signature_1: fake_valid_sig!(),
+			node_signature_2: fake_valid_sig!(),
+			bitcoin_signature_1: fake_valid_sig!(),
+			bitcoin_signature_2: fake_valid_sig!(),
+			contents: UnsignedChannelAnnouncement {
+				features: ChannelFeatures::empty(),
+				chain_hash: Default::default(),
+				short_channel_id: 0,
+				node_id_1: fake_public_key!(),
+				node_id_2: fake_public_key!(),
+				bitcoin_key_1: fake_public_key!(),
+				bitcoin_key_2: fake_public_key!(),
+				excess_data: vec![]
+			}
+		}));
+
+		assert_read_event_errors!(peer_manager, &mut descriptor, false);
+		assert!(peer_manager.get_peer_node_ids().is_empty());
+		assert!(channel_handler_called!(&test_ctx, peer_disconnected));
+		assert!(!descriptor.disconnect_called());
+	}
+
+	macro_rules! channel_announcement_msg {
+		($channel_id: expr, $node_id_1: expr, $node_id_2: expr) => {{
+			ChannelAnnouncement {
+				node_signature_1: fake_valid_sig!(),
+				node_signature_2: fake_valid_sig!(),
+				bitcoin_signature_1: fake_valid_sig!(),
+				bitcoin_signature_2: fake_valid_sig!(),
+				contents: UnsignedChannelAnnouncement {
+					features: ChannelFeatures::empty(),
+					chain_hash: Default::default(),
+					short_channel_id: $channel_id,
+					node_id_1: $node_id_1,
+					node_id_2: $node_id_2,
+					bitcoin_key_1: fake_public_key!(),
+					bitcoin_key_2: fake_public_key!(),
+					excess_data: vec![]
+				}
+			}
+		}}
+	}
+
+	// Test generator macro to reduce duplication across the broadcast message cases.
+	// (test name, expression that returns a routing handler, message that will be queued, closure taking (peer_manager, descriptor) that does the validation)
+	macro_rules! generate_broadcast_message_test {
+		($test_name: ident, $routing_handler: expr, $message: expr, $validation: tt) => {
+			#[test]
+			fn $test_name() {
+				let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::with_routing_handler($routing_handler);
+				let mut descriptor = SocketDescriptorMock::new();
+				let transport = new_connected_transport!(&test_ctx);
+				let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+				transport.borrow_mut().add_incoming_message($message);
+
+				$validation(peer_manager, descriptor)
+			}
+		}
+	}
+
+	// Test that a post-Init connection:
+	// * Returns Ok if a ChannelAnnouncement message is received and the routing handler
+	//   returns ErrorAction::IgnoreError
+	generate_broadcast_message_test!(post_init_handle_channel_announcement_ignore_error, {
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_channel_announcement_return = Err(msgs::LightningError { err: "", action: msgs::ErrorAction::IgnoreError });
+		routing_handler
+	},
+	Message::ChannelAnnouncement(channel_announcement_msg!(0, fake_public_key!(), fake_public_key!())),
+	(| peer_manager: PeerManagerImpl<SocketDescriptorMock, &ChannelMessageHandlerTestSpy, &RoutingMessageHandlerTestStub, &TestLogger, &RefCell<TransportStub>>, mut descriptor |
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false))
+	));
+
+	// Test that a post-Init connection:
+	// * Returns Ok if a ChannelAnnouncement message is received and the routing handler
+	//   returns ErrorAction::IgnoreError
+	// * Enqueues an ErrorMessage for send that is flushed during the next process_events()
+	generate_broadcast_message_test!(post_init_handle_channel_announcement_send_error_message, {
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_channel_announcement_return = Err(msgs::LightningError { err: "", action: msgs::ErrorAction::SendErrorMessage { msg: ErrorMessage { channel_id: [0; 32], data: "".to_string() } } });
+		routing_handler
+	},
+	Message::ChannelAnnouncement(channel_announcement_msg!(0, fake_public_key!(), fake_public_key!())),
+	(| peer_manager: PeerManagerImpl<SocketDescriptorMock, &ChannelMessageHandlerTestSpy, &RoutingMessageHandlerTestStub, &TestLogger, &RefCell<TransportStub>>, mut descriptor | {
+			assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+			let recording = descriptor.get_recording();
+			assert_matches_message!(&recording[0].0, Message::Error(_))
+		}
+	));
+
+	// Test that a post-Init connection:
+	// * Returns Ok if a ChannelAnnouncement message is received and the routing handler
+	//   returns true
+	generate_broadcast_message_test!(post_init_handle_channel_announcement_should_forward, {
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_channel_announcement_return = Ok(true);
+		routing_handler
+	},
+	Message::ChannelAnnouncement(channel_announcement_msg!(0, fake_public_key!(), fake_public_key!())),
+	(| peer_manager: PeerManagerImpl<SocketDescriptorMock, &ChannelMessageHandlerTestSpy, &RoutingMessageHandlerTestStub, &TestLogger, &RefCell<TransportStub>>, mut descriptor | {
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+		}
+	));
+
+	// Test that a post-Init connection:
+	// * Returns Ok if a ChannelAnnouncement message is received and the routing handler
+	//   returns false
+	generate_broadcast_message_test!(post_init_handle_channel_announcement_should_not_forward, {
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_channel_announcement_return = Ok(false);
+		routing_handler
+	},
+	Message::ChannelAnnouncement(channel_announcement_msg!(0, fake_public_key!(), fake_public_key!())),
+	(| peer_manager: PeerManagerImpl<SocketDescriptorMock, &ChannelMessageHandlerTestSpy, &RoutingMessageHandlerTestStub, &TestLogger, &RefCell<TransportStub>>, mut descriptor | {
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+		}
+	));
+
+	macro_rules! node_announcement_msg {
+		() => {{
+			NodeAnnouncement {
+				signature: fake_valid_sig!(),
+				contents: UnsignedNodeAnnouncement {
+					features: NodeFeatures::empty(),
+					timestamp: 0,
+					node_id: fake_public_key!(),
+					rgb: [0; 3],
+					alias: [0; 32],
+					addresses: vec![],
+					excess_address_data: vec![],
+					excess_data: vec![]
+				}
+			}
+		}}
+	}
+
+	// Test that a post-Init connection:
+	// * Returns Ok if a NodeAnnouncement message is received and the routing handler
+	//   returns ErrorAction::IgnoreError
+	generate_broadcast_message_test!(post_init_handle_node_announcement_ignore_error, {
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_node_announcement_return = Err(msgs::LightningError { err: "", action: msgs::ErrorAction::IgnoreError });
+		routing_handler
+	},
+	Message::NodeAnnouncement(node_announcement_msg!()),
+	(| peer_manager: PeerManagerImpl<SocketDescriptorMock, &ChannelMessageHandlerTestSpy, &RoutingMessageHandlerTestStub, &TestLogger, &RefCell<TransportStub>>, mut descriptor |
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false))
+	));
+
+	// Test that a post-Init connection:
+	// * Returns Ok if a NodeAnnouncement message is received and the routing handler
+	//   returns ErrorAction::IgnoreError
+	// * Enqueues an ErrorMessage for send that is flushed during the next process_events()
+	generate_broadcast_message_test!(post_init_handle_node_announcement_send_error_message, {
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_node_announcement_return = Err(msgs::LightningError { err: "", action: msgs::ErrorAction::SendErrorMessage { msg: ErrorMessage { channel_id: [0; 32], data: "".to_string() } } });
+		routing_handler
+	},
+	Message::NodeAnnouncement(node_announcement_msg!()),
+	(| peer_manager: PeerManagerImpl<SocketDescriptorMock, &ChannelMessageHandlerTestSpy, &RoutingMessageHandlerTestStub, &TestLogger, &RefCell<TransportStub>>, mut descriptor | {
+			assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+			let recording = descriptor.get_recording();
+			assert_matches_message!(&recording[0].0, Message::Error(_))
+		}
+	));
+
+	// Test that a post-Init connection:
+	// * Returns Ok if a NodeAnnouncement message is received and the routing handler
+	//   returns true
+	generate_broadcast_message_test!(post_init_handle_node_announcement_should_forward, {
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_node_announcement_return = Ok(true);
+		routing_handler
+	},
+	Message::NodeAnnouncement(node_announcement_msg!()),
+	(| peer_manager: PeerManagerImpl<SocketDescriptorMock, &ChannelMessageHandlerTestSpy, &RoutingMessageHandlerTestStub, &TestLogger, &RefCell<TransportStub>>, mut descriptor | {
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+		}
+	));
+
+	// Test that a post-Init connection:
+	// * Returns Ok if a NodeAnnouncement message is received and the routing handler
+	//   returns false
+	generate_broadcast_message_test!(post_init_handle_node_announcement_should_not_forward, {
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_node_announcement_return = Ok(false);
+		routing_handler
+	},
+	Message::NodeAnnouncement(node_announcement_msg!()),
+	(| peer_manager: PeerManagerImpl<SocketDescriptorMock, &ChannelMessageHandlerTestSpy, &RoutingMessageHandlerTestStub, &TestLogger, &RefCell<TransportStub>>, mut descriptor | {
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+		}
+	));
+
+	macro_rules! channel_update_msg {
+		() => {{
+			ChannelUpdate {
+				signature: fake_valid_sig!(),
+				contents: UnsignedChannelUpdate {
+					chain_hash: Default::default(),
+					short_channel_id: 0,
+					timestamp: 0,
+					flags: 0,
+					cltv_expiry_delta: 0,
+					htlc_minimum_msat: 0,
+					fee_base_msat: 0,
+					fee_proportional_millionths: 0,
+					excess_data: vec![]
+				}
+			}
+		}}
+	}
+
+	// Test that a post-Init connection:
+	// * Returns Ok if a ChannelUpdate message is received and the routing handler
+	//   returns ErrorAction::IgnoreError
+	generate_broadcast_message_test!(post_init_handle_channel_update_ignore_error, {
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_channel_update_return = Err(msgs::LightningError { err: "", action: msgs::ErrorAction::IgnoreError });
+		routing_handler
+	},
+	Message::ChannelUpdate(channel_update_msg!()),
+	(| peer_manager: PeerManagerImpl<SocketDescriptorMock, &ChannelMessageHandlerTestSpy, &RoutingMessageHandlerTestStub, &TestLogger, &RefCell<TransportStub>>, mut descriptor |
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false))
+	));
+
+	// Test that a post-Init connection:
+	// * Returns Ok if a ChannelUpdate message is received and the routing handler
+	//   returns ErrorAction::IgnoreError
+	// * Enqueues an ErrorMessage for send that is flushed during the next process_events()
+	generate_broadcast_message_test!(post_init_handle_channel_update_send_error_message, {
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_channel_update_return = Err(msgs::LightningError { err: "", action: msgs::ErrorAction::SendErrorMessage { msg: ErrorMessage { channel_id: [0; 32], data: "".to_string() } } });
+		routing_handler
+	},
+	Message::ChannelUpdate(channel_update_msg!()),
+	(| peer_manager: PeerManagerImpl<SocketDescriptorMock, &ChannelMessageHandlerTestSpy, &RoutingMessageHandlerTestStub, &TestLogger, &RefCell<TransportStub>>, mut descriptor | {
+			assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+			let recording = descriptor.get_recording();
+			assert_matches_message!(&recording[0].0, Message::Error(_))
+		}
+	));
+
+	// Test that a post-Init connection:
+	// * Returns Ok if a ChannelUpdate message is received and the routing handler
+	//   returns true
+	generate_broadcast_message_test!(post_init_handle_channel_update_should_forward, {
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_channel_update_return = Ok(true);
+		routing_handler
+	},
+	Message::ChannelUpdate(channel_update_msg!()),
+	(| peer_manager: PeerManagerImpl<SocketDescriptorMock, &ChannelMessageHandlerTestSpy, &RoutingMessageHandlerTestStub, &TestLogger, &RefCell<TransportStub>>, mut descriptor | {
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+		}
+	));
+
+	// Test that a post-Init connection:
+	// * Returns Ok if a ChannelUpdate message is received and the routing handler
+	//   returns false
+	generate_broadcast_message_test!(post_init_handle_channel_update_should_not_forward, {
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_channel_update_return = Ok(false);
+		routing_handler
+	},
+	Message::ChannelUpdate(channel_update_msg!()),
+	(| peer_manager: PeerManagerImpl<SocketDescriptorMock, &ChannelMessageHandlerTestSpy, &RoutingMessageHandlerTestStub, &TestLogger, &RefCell<TransportStub>>, mut descriptor | {
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+		}
+	));
+
+	//  _____                 _     _____         _   _
+	// | ____|_   _____ _ __ | |_  |_   _|__  ___| |_(_)_ __   __ _
+	// |  _| \ \ / / _ \ '_ \| __|   | |/ _ \/ __| __| | '_ \ / _` |
+	// | |___ \ V /  __/ | | | |_    | |  __/\__ \ |_| | | | | (_| |
+	// |_____| \_/ \___|_| |_|\__|   |_|\___||___/\__|_|_| |_|\__, |
+	//                                                         |___/
+
+	// To reduce test expansion, the unknown, unconnected, and connected variants are only run
+	// on one event type. All handlers use the same accessor to retrieve the connected node so one
+	// test of those paths should be sufficient. The initialized variant is run on all types which
+	// is where the interesting code is run. Once features are added to take action on unconnected
+	// nodes, this should be revisited.
+
+	// Test that a post-Init connection:
+	// * does not send an OpenChannel message when it receives a SendOpenChannel event if the peer
+	//   is unknown
+	#[test]
+	fn unknown_node_send_open_channel_event() {
+		let channel_handler = TestChannelMessageHandler::new();
+		channel_handler.pending_events.lock().unwrap().push(MessageSendEvent::SendOpenChannel {
+			node_id: fake_public_key!(),
+			msg: open_channel_msg!()
+		});
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_handler(channel_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+		assert!(descriptor.get_recording().is_empty());
+	}
+
+	// Test that a post-Init connection:
+	// * does not send an OpenChannel message when it receives a SendOpenChannel event if the peer
+	//   is known, but the NOISE handshake is not complete
+	#[test]
+	fn unconnected_transport_send_open_channel_event() {
+		let channel_handler = TestChannelMessageHandler::new();
+		channel_handler.pending_events.lock().unwrap().push(MessageSendEvent::SendOpenChannel {
+			node_id: fake_public_key!(),
+			msg: open_channel_msg!()
+		});
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_handler(channel_handler);
+		let descriptor = SocketDescriptorMock::new();
+		let mut transport = new_unconnected_transport!();
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+		new_outbound!(peer_manager, descriptor, &mut transport);
+
+		peer_manager.process_events();
+
+		assert!(descriptor.get_recording().is_empty());
+	}
+
+	// Test that a post-Init connection:
+	// * does not send an OpenChannel message when it receives a SendOpenChannel event if the peer
+	//   is known, but the INIT message has not been received
+	#[test]
+	fn connected_transport_send_open_channel_event() {
+		let channel_handler = TestChannelMessageHandler::new();
+		channel_handler.pending_events.lock().unwrap().push(MessageSendEvent::SendOpenChannel {
+			node_id: fake_public_key!(),
+			msg: open_channel_msg!()
+		});
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_handler(channel_handler);
+		let descriptor = SocketDescriptorMock::new();
+		let mut transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+		new_outbound!(peer_manager, descriptor, &mut transport);
+
+		peer_manager.process_events();
+
+		assert!(descriptor.get_recording().is_empty());
+	}
+
+	// Test generator macro to reduce duplication across the event handlers that just enqueue a message
+	// (test name, expression that returns a routing handler, message that will be queued, closure taking (peer_manager, descriptor) that does the validation)
+	macro_rules! generate_event_handler_test {
+		($test_name: ident, $event: expr, $expected_message: pat) => {
+			#[test]
+			fn $test_name() {
+				let channel_handler = TestChannelMessageHandler::new();
+				channel_handler.pending_events.lock().unwrap().push($event);
+
+				let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_handler(channel_handler);
+				let mut descriptor = SocketDescriptorMock::new();
+				let transport = new_connected_transport!(&test_ctx);
+				let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+				peer_manager.process_events();
+
+				let recording = descriptor.get_recording();
+				assert_matches_message!(&recording[0].0, $expected_message);
+			}
+		}
+	}
+
+	// Test that a post-Init connection:
+	// * sends an OpenChannel message when it receives a SendOpenChannel event for an initialized node
+	generate_event_handler_test!(post_init_send_open_channel,
+		SendOpenChannel {
+			node_id: test_ctx_their_node_id!(),
+			msg: open_channel_msg!(),
+		},
+		Message::OpenChannel(_)
+	);
+
+	// Test that a post-Init connection:
+	// * sends an AcceptChannel message when it receives a SendAcceptChannel event for an initialized node
+	generate_event_handler_test!(post_init_send_accept_channel,
+		SendAcceptChannel {
+			node_id: test_ctx_their_node_id!(),
+			msg: accept_channel_msg!(),
+		},
+		Message::AcceptChannel(_)
+	);
+
+	// Test that a post-Init connection:
+	// * sends an AcceptChannel message when it receives a SendAcceptChannel event for an initialized node
+	generate_event_handler_test!(post_init_send_funding_created,
+		SendFundingCreated {
+			node_id: test_ctx_their_node_id!(),
+			msg: funding_created_msg!(),
+		},
+		Message::FundingCreated(_)
+	);
+
+	// Test that a post-Init connection:
+	// * sends an FundingSigned message when it receives a SendFundingSigned event for an initialized node
+	generate_event_handler_test!(post_init_send_funding_signed,
+		SendFundingSigned {
+			node_id: test_ctx_their_node_id!(),
+			msg: funding_signed_msg!(),
+		},
+		Message::FundingSigned(_)
+	);
+
+	// Test that a post-Init connection:
+	// * sends an FundingLocked message when it receives a SendFundingLocked event for an initialized node
+	generate_event_handler_test!(post_init_send_funding_locked,
+		SendFundingLocked {
+			node_id: test_ctx_their_node_id!(),
+			msg: funding_locked_msg!(),
+		},
+		Message::FundingLocked(_)
+	);
+
+	// Test that a post-Init connection:
+	// * sends an AnnouncementSignatures message when it receives a SendAnnouncementSignatures event for an initialized node
+	generate_event_handler_test!(post_init_send_announcement_signatures,
+		SendAnnouncementSignatures {
+			node_id: test_ctx_their_node_id!(),
+			msg: announcement_signatures_msg!(),
+		},
+		Message::AnnouncementSignatures(_)
+	);
+
+	// Test that a post-Init connection:
+	// * sends an RevokeAndACK message when it receives a SendRevokeAndACK event for an initialized node
+	generate_event_handler_test!(post_init_send_revoke_ack,
+		SendRevokeAndACK {
+			node_id: test_ctx_their_node_id!(),
+			msg: revoke_and_ack_msg!(),
+		},
+		Message::RevokeAndACK(_)
+	);
+
+	// Test that a post-Init connection:
+	// * sends an ClosingSigned message when it receives a SendClosingSigned event for an initialized node
+	generate_event_handler_test!(post_init_send_closing_signed,
+		SendClosingSigned {
+			node_id: test_ctx_their_node_id!(),
+			msg: closing_signed_msg!(),
+		},
+		Message::ClosingSigned(_)
+	);
+
+	// Test that a post-Init connection:
+	// * sends an Shutdown message when it receives a Shutdown event for an initialized node
+	generate_event_handler_test!(post_init_send_shutdown,
+		SendShutdown {
+			node_id: test_ctx_their_node_id!(),
+			msg: shutdown_msg!(),
+		},
+		Message::Shutdown(_)
+	);
+
+	// Test that a post-Init connection:
+	// * sends an ChannelReestablish message when it receives a SendChannelReestablish event for an initialized node
+	generate_event_handler_test!(post_init_send_channel_reestablish,
+		SendChannelReestablish {
+			node_id: test_ctx_their_node_id!(),
+			msg: channel_reestablish_msg!()
+		},
+		Message::ChannelReestablish(_)
+	);
+
+	// Test that a post-Init connection:
+	// * sends relevant HTLC messages when it receives a UpdateHTLC event for an initialized node
+	#[test]
+	fn post_init_send_update_htlcs() {
+		let channel_handler = TestChannelMessageHandler::new();
+		channel_handler.pending_events.lock().unwrap().push(UpdateHTLCs {
+			node_id: test_ctx_their_node_id!(),
+			updates: CommitmentUpdate {
+				update_add_htlcs: vec![update_add_htlc_msg!()],
+				update_fulfill_htlcs: vec![update_fulfill_htlc_msg!()],
+				update_fail_htlcs: vec![update_fail_htlc_msg!()],
+				update_fail_malformed_htlcs: vec![update_fail_malformed_htlc_msg!()],
+				update_fee: Some(update_fee_msg!()),
+				commitment_signed: commitment_signed_msg!()
+			}
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_handler(channel_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+
+		let recording = descriptor.get_recording();
+		assert_matches_message!(&recording[0].0, Message::UpdateAddHTLC(_));
+		assert_matches_message!(&recording[1].0, Message::UpdateFulfillHTLC(_));
+		assert_matches_message!(&recording[2].0, Message::UpdateFailHTLC(_));
+		assert_matches_message!(&recording[3].0, Message::UpdateFailMalformedHTLC(_));
+		assert_matches_message!(&recording[4].0, Message::UpdateFee(_));
+		assert_matches_message!(&recording[5].0, Message::CommitmentSigned(_));
+	}
+
+	// Test that a post-Init connection:
+	// * sends nothing when it receives a BroadcastChannelAnnouncement if the route_handler.handle_channel_announcement errors
+	#[test]
+	fn post_init_broadcast_channel_announcement_route_handler_handle_announcement_errors() {
+		let channel_handler = TestChannelMessageHandler::new();
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_channel_announcement_return = Err(msgs::LightningError { err: "", action: msgs::ErrorAction::IgnoreError });
+		channel_handler.pending_events.lock().unwrap().push(BroadcastChannelAnnouncement {
+			msg: channel_announcement_msg!(0, fake_public_key!(), fake_public_key!()),
+			update_msg: channel_update_msg!()
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_and_routing(channel_handler, routing_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+		assert!(descriptor.get_recording().is_empty());
+	}
+
+	// Test that a post-Init connection:
+	// * sends nothing when it receives a BroadcastChannelAnnouncement if the route_handler.handle_channel_update errors
+	#[test]
+	fn post_init_broadcast_channel_announcement_route_handler_handle_update_errors() {
+		let channel_handler = TestChannelMessageHandler::new();
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_channel_update_return = Err(msgs::LightningError { err: "", action: msgs::ErrorAction::IgnoreError });
+		channel_handler.pending_events.lock().unwrap().push(BroadcastChannelAnnouncement {
+			msg: channel_announcement_msg!(0, fake_public_key!(), fake_public_key!()),
+			update_msg: channel_update_msg!()
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_and_routing(channel_handler, routing_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+		assert!(descriptor.get_recording().is_empty());
+	}
+
+	// Test that a post-Init connection:
+	// * sends nothing when it receives a BroadcastChannelAnnouncement if the route_handler.handle_channel_announcement returns false
+	// XXXBUG: Implementation does not check return value of handle_channel_announcement, only that it didn't error
+	#[test]
+	fn post_init_broadcast_channel_announcement_route_handler_handle_announcement_returns_false() {
+		let channel_handler = TestChannelMessageHandler::new();
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_channel_announcement_return = Ok(false);
+		channel_handler.pending_events.lock().unwrap().push(BroadcastChannelAnnouncement {
+			msg: channel_announcement_msg!(0, fake_public_key!(), fake_public_key!()),
+			update_msg: channel_update_msg!()
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_and_routing(channel_handler, routing_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+		// assert!(descriptor.get_recording().is_empty());
+	}
+
+	// Test that a post-Init connection:
+	// * sends nothing when it receives a BroadcastChannelAnnouncement if the route_handler.handle_channel_update returns false
+	// XXXBUG: Implementation does not check return value of handle_channel_update, only that it didn't error
+	#[test]
+	fn post_init_broadcast_channel_announcement_route_handle_update_returns_false() {
+		let channel_handler = TestChannelMessageHandler::new();
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_channel_update_return = Ok(false);
+		channel_handler.pending_events.lock().unwrap().push(BroadcastChannelAnnouncement {
+			msg: channel_announcement_msg!(0, fake_public_key!(), fake_public_key!()),
+			update_msg: channel_update_msg!()
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_and_routing(channel_handler, routing_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+		// assert!(descriptor.get_recording().is_empty());
+	}
+
+	// To reduce test expansion, the unconnected and connected transport tests are only run on one
+	// broadcast variant. All broadcast implementations use the same API to determine whether or not
+	// the peer wants the announcement forwarded.
+
+	// Test that a post-Init connection:
+	// * sends nothing when it receives a BroadcastChannelAnnouncement if the peer has not completed the NOISE handshake
+	#[test]
+	fn unconnected_transport_broadcast_channel_announcement() {
+		let channel_handler = TestChannelMessageHandler::new();
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_channel_update_return = Ok(false);
+		channel_handler.pending_events.lock().unwrap().push(BroadcastChannelAnnouncement {
+			msg: channel_announcement_msg!(0, fake_public_key!(), fake_public_key!()),
+			update_msg: channel_update_msg!()
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_and_routing(channel_handler, routing_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_unconnected_transport!();
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+		new_outbound!(peer_manager, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+		assert!(descriptor.get_recording().is_empty());
+	}
+
+	// Test that a post-Init connection:
+	// * sends nothing when it receives a BroadcastChannelAnnouncement if the peer has not received an INIT message
+	#[test]
+	fn connected_transport_broadcast_channel_announcement() {
+		let channel_handler = TestChannelMessageHandler::new();
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_channel_update_return = Ok(false);
+		channel_handler.pending_events.lock().unwrap().push(BroadcastChannelAnnouncement {
+			msg: channel_announcement_msg!(0, fake_public_key!(), fake_public_key!()),
+			update_msg: channel_update_msg!()
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_and_routing(channel_handler, routing_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+		new_outbound!(peer_manager, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+		assert!(descriptor.get_recording().is_empty());
+	}
+
+	// Test that a post-Init connection:
+	// * sends nothing when it receives a BroadcastChannelAnnouncement if the peer is initialized,
+	//   but Peer::should_forward_channel_announcement returns false
+	#[test]
+	fn connected_transport_broadcast_channel_announcement_short_channel_id_larger_than_current_sync() {
+		let channel_handler = TestChannelMessageHandler::new();
+		let routing_handler = RoutingMessageHandlerTestStub::new();
+		channel_handler.pending_events.lock().unwrap().push(BroadcastChannelAnnouncement {
+			msg: channel_announcement_msg!(10000, fake_public_key!(), fake_public_key!()),
+			update_msg: channel_update_msg!()
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_and_routing(channel_handler, routing_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_for_test!(&test_ctx);
+		new_outbound!(peer_manager, &mut descriptor, &transport);
+
+		// Use an Init sequence with initial_routing_sync and use an arbitrarily high short
+		// channel_id in the channel_announcement_msg to create the state. This test knows a bit too
+		// much and future refactoring can make this much better.
+		transport.borrow_mut().add_incoming_message(Message::Init(Init { features: InitFeatures::known() }));
+		peer_manager.process_events();
+		assert!(descriptor.get_recording().is_empty());
+	}
+
+	// Test that a post-Init connection:
+	// * sends nothing when it receives a BroadcastChannelAnnouncement if the peer is node_id_1
+	#[test]
+	fn post_init_broadcast_channel_announcement_skip_node_id_1() {
+		let channel_handler = TestChannelMessageHandler::new();
+		channel_handler.pending_events.lock().unwrap().push(BroadcastChannelAnnouncement {
+			msg: channel_announcement_msg!(0, test_ctx_their_node_id!(), fake_public_key!()),
+			update_msg: channel_update_msg!()
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_handler(channel_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+		assert!(descriptor.get_recording().is_empty());
+	}
+
+	// Test that a post-Init connection:
+	// * sends nothing when it receives a BroadcastChannelAnnouncement if the peer is node_id_2
+	#[test]
+	fn post_init_broadcast_channel_announcement_skip_node_id_2() {
+		let channel_handler = TestChannelMessageHandler::new();
+		channel_handler.pending_events.lock().unwrap().push(BroadcastChannelAnnouncement {
+			msg: channel_announcement_msg!(0, fake_public_key!(), test_ctx_their_node_id!()),
+			update_msg: channel_update_msg!()
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_handler(channel_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+		assert!(descriptor.get_recording().is_empty());
+	}
+
+	// Test that a post-Init connection:
+	// * sends the relevant messages when it receives a BroadcastChannelAnnouncement
+	#[test]
+	fn post_init_broadcast_channel_announcement() {
+		let channel_handler = TestChannelMessageHandler::new();
+		channel_handler.pending_events.lock().unwrap().push(BroadcastChannelAnnouncement {
+			msg: channel_announcement_msg!(0, fake_public_key!(), fake_public_key!()),
+			update_msg: channel_update_msg!()
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_handler(channel_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+
+		let recording = descriptor.get_recording();
+		assert_matches_message!(&recording[0].0, Message::ChannelAnnouncement(_));
+		assert_matches_message!(&recording[1].0, Message::ChannelUpdate(_));
+	}
+
+	// Test that a post-Init connection:
+	// * sends nothing when it receives a BroadcastNodeAnnouncement if the route_handler.handle_node_announcement errors
+	#[test]
+	fn post_init_broadcast_node_announcement_route_handler_handle_announcement_errors() {
+		let channel_handler = TestChannelMessageHandler::new();
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_node_announcement_return = Err(msgs::LightningError { err: "", action: msgs::ErrorAction::IgnoreError });
+		channel_handler.pending_events.lock().unwrap().push(BroadcastNodeAnnouncement {
+			msg: node_announcement_msg!()
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_and_routing(channel_handler, routing_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+		assert!(descriptor.get_recording().is_empty());
+	}
+
+	// Test that a post-Init connection:
+	// * sends nothing when it receives a BroadcastNodeAnnouncement if the route_handler.handle_node_announcement returns false
+	// XXXBUG: Implementation does not check return value of handle_node_announcement, only that it didn't error
+	#[test]
+	fn post_init_broadcast_node_announcement_route_handler_handle_announcement_returns_false() {
+		let channel_handler = TestChannelMessageHandler::new();
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_node_announcement_return = Ok(false);
+		channel_handler.pending_events.lock().unwrap().push(BroadcastNodeAnnouncement {
+			msg: node_announcement_msg!()
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_and_routing(channel_handler, routing_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+		// assert!(descriptor.get_recording().is_empty());
+	}
+
+	// Test that a post-Init connection:
+	// * sends the relevant messages when it receives a BroadcastNodeAnnouncement
+	#[test]
+	fn post_init_broadcast_node_announcement() {
+		let channel_handler = TestChannelMessageHandler::new();
+		channel_handler.pending_events.lock().unwrap().push(BroadcastNodeAnnouncement {
+			msg: node_announcement_msg!()
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_handler(channel_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+
+		let recording = descriptor.get_recording();
+		assert_matches_message!(&recording[0].0, Message::NodeAnnouncement(_));
+	}
+
+
+	// Test that a post-Init connection:
+	// * sends nothing when it receives a BroadcastChannelUpdate if the route_handler.handle_channel_update errors
+	#[test]
+	fn post_init_broadcast_channel_update_route_handler_handle_update_errors() {
+		let channel_handler = TestChannelMessageHandler::new();
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_channel_update_return = Err(msgs::LightningError { err: "", action: msgs::ErrorAction::IgnoreError });
+		channel_handler.pending_events.lock().unwrap().push(BroadcastChannelUpdate {
+			msg: channel_update_msg!()
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_and_routing(channel_handler, routing_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+		assert!(descriptor.get_recording().is_empty());
+	}
+
+	// Test that a post-Init connection:
+	// * sends nothing when it receives a BroadcastChannelUpdate if the route_handler.handle_channel_update returns false
+	// XXXBUG: Implementation does not check return value of handle_node_announcement, only that it didn't error
+	#[test]
+	fn post_init_broadcast_channel_update_route_handler_handle_update_returns_false() {
+		let channel_handler = TestChannelMessageHandler::new();
+		let mut routing_handler = RoutingMessageHandlerTestStub::new();
+		routing_handler.handle_channel_update_return = Ok(false);
+		channel_handler.pending_events.lock().unwrap().push(BroadcastChannelUpdate {
+			msg: channel_update_msg!()
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_and_routing(channel_handler, routing_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+		// assert!(descriptor.get_recording().is_empty());
+	}
+
+	// Test that a post-Init connection:
+	// * sends the relevant messages when it receives a BroadcastChannelAnnouncement
+	#[test]
+	fn post_init_broadcast_channel_update() {
+		let channel_handler = TestChannelMessageHandler::new();
+		channel_handler.pending_events.lock().unwrap().push(BroadcastChannelUpdate {
+			msg: channel_update_msg!()
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_handler(channel_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+
+		let recording = descriptor.get_recording();
+		assert_matches_message!(&recording[0].0, Message::ChannelUpdate(_));
+	}
+
+	// Test that a post-Init connection:
+	// * calls the correct route handler callback when it receives a PaymentFailureNetworkUpdate event
+	#[test]
+	fn post_init_payment_failure_network_update() {
+		let routing_handler = RoutingMessageHandlerTestSpy::new();
+		let channel_handler = TestChannelMessageHandler::new();
+		channel_handler.pending_events.lock().unwrap().push(PaymentFailureNetworkUpdate {
+			update: HTLCFailChannelUpdate::ChannelUpdateMessage {
+				msg: channel_update_msg!()
+			}
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestSpy>::with_channel_and_routing(channel_handler, routing_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+
+		assert!(route_handler_called!(&test_ctx, handle_htlc_fail_channel_update));
+	}
+
+	// Test that a post-Init connection:
+	// * When it receives a HandleErrorEvent::DisconnectPeer for an unknown peer
+	// * ignores it
+	#[test]
+	fn post_init_handle_error_event_disconnect_unknown_peer() {
+		let channel_handler = TestChannelMessageHandler::new();
+		channel_handler.pending_events.lock().unwrap().push(HandleError {
+			node_id: fake_public_key!(),
+			action: ErrorAction::DisconnectPeer { msg: None }
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_handler(channel_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+
+		assert!(!descriptor.disconnect_called());
+		assert!(descriptor.get_recording().is_empty());
+		assert!(!peer_manager.get_peer_node_ids().is_empty());
+	}
+
+	// Test that a post-Init connection:
+	// * When it receives a HandleErrorEvent::DisconnectPeer for an initialized peer w/ no message
+	// * node_id is no longer in get_peer_node_ids()
+	// * socket_disconnected() is called on the SocketDescriptor
+	#[test]
+	fn post_init_handle_error_event_disconnect_no_message() {
+		let channel_handler = TestChannelMessageHandler::new();
+		channel_handler.pending_events.lock().unwrap().push(HandleError {
+			node_id: test_ctx_their_node_id!(),
+			action: ErrorAction::DisconnectPeer { msg: None }
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_handler(channel_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+
+		assert!(descriptor.disconnect_called());
+		assert!(descriptor.get_recording().is_empty());
+		assert!(peer_manager.get_peer_node_ids().is_empty());
+	}
+
+	// Test that a post-Init connection:
+	// * When it receives a HandleErrorEvent::DisconnectPeer for an initialized peer w/ a message
+	// * node_id is no longer in get_peer_node_ids()
+	// * error message is sent through SocketDescriptor (attempted)
+	// * socket_disconnected() is called on the SocketDescriptor
+	#[test]
+	fn post_init_handle_error_event_disconnect_message() {
+		let channel_handler = TestChannelMessageHandler::new();
+		channel_handler.pending_events.lock().unwrap().push(HandleError {
+			node_id: test_ctx_their_node_id!(),
+			action: ErrorAction::DisconnectPeer { msg: Some(ErrorMessage {
+				channel_id: [0; 32],
+				data: "".to_string()
+			})}
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_handler(channel_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+
+		let recording = descriptor.get_recording();
+		assert_matches_message!(&recording[0].0, Message::Error(_));
+		assert!(descriptor.disconnect_called());
+		assert!(peer_manager.get_peer_node_ids().is_empty());
+	}
+
+	// Test that a post-Init connection:
+	// * When it receives a HandleErrorEvent::IgnoreError for an initialized peer
+	// * is ignored
+	#[test]
+	fn post_init_handle_error_event_ignore_error() {
+		let channel_handler = TestChannelMessageHandler::new();
+		channel_handler.pending_events.lock().unwrap().push(HandleError {
+			node_id: test_ctx_their_node_id!(),
+			action: ErrorAction::IgnoreError
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_handler(channel_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+
+		assert!(!descriptor.disconnect_called());
+		assert!(descriptor.get_recording().is_empty());
+		assert!(!peer_manager.get_peer_node_ids().is_empty());
+	}
+
+	// Test that a post-Init connection:
+	// * When it receives a HandleErrorEvent::SendErrorMessage for an initialized peer
+	// * error message is sent through SocketDescriptor
+	#[test]
+	fn post_init_handle_error_event_send_error_message() {
+		let channel_handler = TestChannelMessageHandler::new();
+		channel_handler.pending_events.lock().unwrap().push(HandleError {
+			node_id: test_ctx_their_node_id!(),
+			action: ErrorAction::SendErrorMessage {
+				msg: ErrorMessage { channel_id: [0; 32], data: "".to_string() }
+			}
+		});
+
+		let test_ctx = TestCtx::<TestChannelMessageHandler, RoutingMessageHandlerTestStub>::with_channel_handler(channel_handler);
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.process_events();
+
+		let recording = descriptor.get_recording();
+		assert_matches_message!(&recording[0].0, Message::Error(_));
+		assert!(!descriptor.disconnect_called());
+		assert!(!peer_manager.get_peer_node_ids().is_empty());
+	}
+
+	//  ____  _               _____         _   _
+	// |  _ \(_)_ __   __ _  |_   _|__  ___| |_(_)_ __   __ _
+	// | |_) | | '_ \ / _` |   | |/ _ \/ __| __| | '_ \ / _` |
+	// |  __/| | | | | (_| |   | |  __/\__ \ |_| | | | | (_| |
+	// |_|   |_|_| |_|\__, |   |_|\___||___/\__|_|_| |_|\__, |
+	//                 |___/                             |___/
+
+	// Test that a post-Init connection:
+	// * queues a Pong when it receives a Ping
+	#[test]
+	fn post_init_ping_creates_pong() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		transport.borrow_mut().add_incoming_message(Message::Ping(Ping { ponglen: 1, byteslen: 0 }));
+
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+
+		peer_manager.process_events();
+
+		let recording = descriptor.get_recording();
+		assert_matches_message!(&recording[0].0, Message::Pong(Pong { byteslen: 1}));
+	}
+
+	// Test that a post-Init connection:
+	// * ignores a Pong with ponglen > 65531
+	#[test]
+	fn post_init_ping_ignores_large_pong() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		transport.borrow_mut().add_incoming_message(Message::Ping(Ping { ponglen: 65532, byteslen: 0 }));
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+		descriptor.assert_called_with(vec![]);
+
+		peer_manager.process_events();
+		descriptor.assert_called_with(vec![]);
+	}
+
+	// Test that a post-Init connection:
+	// * timer_tick_occurred() generates a Ping
+	#[test]
+	fn post_init_timer_tick_occurred_generates_ping() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.timer_tick_occured();
+
+		let recording = descriptor.get_recording();
+		assert_matches_message!(&recording[0].0, Message::Ping(_));
+	}
+
+	// Test that a post-Init connection:
+	// * timer_tick_occurred() disconnects if a Pong was not received
+	// * disconnected node is not in get_peer_node_ids()
+	// * calls the peer_disconnected channel manager callback
+	#[test]
+	fn post_init_ping_no_pong_disconnects() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.timer_tick_occured();
+
+		// Elapsed time with no Pong
+
+		peer_manager.timer_tick_occured();
+
+		assert!(descriptor.disconnect_called());
+		assert!(!peer_manager.get_peer_node_ids().contains(&test_ctx.their_node_id));
+		assert!(channel_handler_called!(&test_ctx, peer_disconnected));
+	}
+
+	// Test that a post-Init connection:
+	// * timer_tick_occurred() does not disconnect if a Pong was received
+	#[test]
+	fn post_init_ping_with_pong() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.timer_tick_occured();
+
+		transport.borrow_mut().add_incoming_message(Message::Pong(Pong { byteslen: 64 }));
+		assert_matches!(peer_manager.read_event(&mut descriptor, &[]), Ok(false));
+
+		// Should notice the Pong and resend Ping
+		peer_manager.timer_tick_occured();
+
+		let recording = descriptor.get_recording();
+		assert_matches_message!(&recording[1].0, Message::Ping(_));
+		assert!(peer_manager.get_peer_node_ids().contains(&test_ctx.their_node_id));
+	}
+
+	// Test that a post-Init connection:
+	// * socket_disconnected() removes the node_id from get_peer_node_ids()
+	// * does not call disconnect_socket() on the SocketDescriptor
+	// * calls the peer_disconnected channel manager callback
+	#[test]
+	fn post_init_socket_disconnected() {
+		let test_ctx = TestCtx::<ChannelMessageHandlerTestSpy, RoutingMessageHandlerTestStub>::new();
+		let mut descriptor = SocketDescriptorMock::new();
+		let transport = new_connected_transport!(&test_ctx);
+		let peer_manager = new_peer_manager_post_init!(&test_ctx, &mut descriptor, &transport);
+
+		peer_manager.socket_disconnected(&descriptor);
+
+		assert!(peer_manager.get_peer_node_ids().is_empty());
+		assert!(!descriptor.disconnect_called());
+		assert!(channel_handler_called!(&test_ctx, peer_disconnected));
 	}
 }
 
@@ -1282,7 +3406,7 @@ mod tests {
 
 	fn establish_connection<'a>(peer_a: &PeerManager<FileDescriptor, &'a test_utils::TestChannelMessageHandler, &'a test_utils::TestRoutingMessageHandler, &'a test_utils::TestLogger>, peer_b: &PeerManager<FileDescriptor, &'a test_utils::TestChannelMessageHandler, &'a test_utils::TestRoutingMessageHandler, &'a test_utils::TestLogger>) -> (FileDescriptor, FileDescriptor) {
 		let secp_ctx = Secp256k1::new();
-		let a_id = PublicKey::from_secret_key(&secp_ctx, &peer_a.our_node_secret);
+		let a_id = PublicKey::from_secret_key(&secp_ctx, &peer_a.inner.our_node_secret);
 		let mut fd_a = FileDescriptor { fd: 1, outbound_data: Arc::new(Mutex::new(Vec::new())) };
 		let mut fd_b = FileDescriptor { fd: 1, outbound_data: Arc::new(Mutex::new(Vec::new())) };
 		let initial_data = peer_b.new_outbound_connection(a_id, fd_b.clone()).unwrap();
@@ -1308,20 +3432,20 @@ mod tests {
 		let chan_handler = test_utils::TestChannelMessageHandler::new();
 		let mut peers = create_network(2, &cfgs);
 		establish_connection(&peers[0], &peers[1]);
-		assert_eq!(peers[0].peers.lock().unwrap().peers.len(), 1);
+		assert_eq!(peers[0].inner.peers.lock().unwrap().peers.len(), 1);
 
 		let secp_ctx = Secp256k1::new();
-		let their_id = PublicKey::from_secret_key(&secp_ctx, &peers[1].our_node_secret);
+		let their_id = PublicKey::from_secret_key(&secp_ctx, &peers[1].inner.our_node_secret);
 
 		chan_handler.pending_events.lock().unwrap().push(events::MessageSendEvent::HandleError {
 			node_id: their_id,
 			action: msgs::ErrorAction::DisconnectPeer { msg: None },
 		});
 		assert_eq!(chan_handler.pending_events.lock().unwrap().len(), 1);
-		peers[0].message_handler.chan_handler = &chan_handler;
+		peers[0].inner.message_handler.chan_handler = &chan_handler;
 
 		peers[0].process_events();
-		assert_eq!(peers[0].peers.lock().unwrap().peers.len(), 0);
+		assert_eq!(peers[0].inner.peers.lock().unwrap().peers.len(), 0);
 	}
 
 	#[test]
@@ -1330,15 +3454,15 @@ mod tests {
 		let cfgs = create_peermgr_cfgs(2);
 		let peers = create_network(2, &cfgs);
 		establish_connection(&peers[0], &peers[1]);
-		assert_eq!(peers[0].peers.lock().unwrap().peers.len(), 1);
+		assert_eq!(peers[0].inner.peers.lock().unwrap().peers.len(), 1);
 
 		// peers[0] awaiting_pong is set to true, but the Peer is still connected
 		peers[0].timer_tick_occured();
-		assert_eq!(peers[0].peers.lock().unwrap().peers.len(), 1);
+		assert_eq!(peers[0].inner.peers.lock().unwrap().peers.len(), 1);
 
 		// Since timer_tick_occured() is called again when awaiting_pong is true, all Peers are disconnected
 		peers[0].timer_tick_occured();
-		assert_eq!(peers[0].peers.lock().unwrap().peers.len(), 0);
+		assert_eq!(peers[0].inner.peers.lock().unwrap().peers.len(), 0);
 	}
 
 	#[test]
@@ -1378,8 +3502,8 @@ mod tests {
 			let peers = create_network(2, &cfgs);
 			let (fd_0_to_1, fd_1_to_0) = establish_connection_and_read_events(&peers[0], &peers[1]);
 
-			let peer_0 = peers[0].peers.lock().unwrap();
-			let peer_1 = peers[1].peers.lock().unwrap();
+			let peer_0 = peers[0].inner.peers.lock().unwrap();
+			let peer_1 = peers[1].inner.peers.lock().unwrap();
 
 			let peer_0_features = peer_1.peers.get(&fd_1_to_0).unwrap().their_features.as_ref();
 			let peer_1_features = peer_0.peers.get(&fd_0_to_1).unwrap().their_features.as_ref();
@@ -1395,8 +3519,8 @@ mod tests {
 			let peers = create_network(2, &cfgs);
 			let (fd_0_to_1, fd_1_to_0) = establish_connection_and_read_events(&peers[0], &peers[1]);
 
-			let peer_0 = peers[0].peers.lock().unwrap();
-			let peer_1 = peers[1].peers.lock().unwrap();
+			let peer_0 = peers[0].inner.peers.lock().unwrap();
+			let peer_1 = peers[1].inner.peers.lock().unwrap();
 
 			let peer_0_features = peer_1.peers.get(&fd_1_to_0).unwrap().their_features.as_ref();
 			let peer_1_features = peer_0.peers.get(&fd_0_to_1).unwrap().their_features.as_ref();
