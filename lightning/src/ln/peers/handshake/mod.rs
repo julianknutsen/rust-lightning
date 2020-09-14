@@ -8,6 +8,7 @@ use ln::peers::conduit::Conduit;
 use ln::peers::handshake::states::{HandshakeState, IHandshakeState};
 
 mod acts;
+mod handshake_hash;
 mod states;
 
 /// Object for managing handshakes.
